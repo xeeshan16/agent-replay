@@ -1,5 +1,7 @@
 # Agent Replay
 
+[![01-agent-replay](https://github.com/xeeshan16/ai-engineering-lab/actions/workflows/01-agent-replay.yml/badge.svg)](https://github.com/xeeshan16/ai-engineering-lab/actions/workflows/01-agent-replay.yml)
+
 **Record, replay and regression-gate AI agent trajectories.**
 
 > Status: 🚧 in progress (day 1 of 7). See [docs/PLAN.md](docs/PLAN.md) and
