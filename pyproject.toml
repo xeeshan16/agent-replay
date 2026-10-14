@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-replay"
+version = "0.1.0"
+description = "Record, replay and regression-gate AI agent trajectories."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "Zeeshan Imdad" }]
+dependencies = [
+  "pydantic>=2.8,<3",
+  "opentelemetry-api>=1.27,<2",
+  "opentelemetry-sdk>=1.27,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+agent-replay = "agent_replay.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_replay"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "ASYNC", "PT", "N", "S", "TRY", "PL"]
+ignore = [
+  "TRY003",   # long messages on custom exceptions are fine
+  "PLR0913",  # explicit keyword-only constructors are clearer than config bags
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "S106", "S311"]
+# The CLI runs one event loop per command; small blocking file I/O there is intentional.
+"src/agent_replay/cli.py" = ["ASYNC240"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+files = ["src", "tests"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["integration: tests that exercise several components end to end"]
