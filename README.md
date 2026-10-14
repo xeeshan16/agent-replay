@@ -1,6 +1,6 @@
 # Agent Replay
 
-[![01-agent-replay](https://github.com/xeeshan16/ai-engineering-lab/actions/workflows/01-agent-replay.yml/badge.svg)](https://github.com/xeeshan16/ai-engineering-lab/actions/workflows/01-agent-replay.yml)
+[![CI](https://github.com/xeeshan16/agent-replay/actions/workflows/ci.yml/badge.svg)](https://github.com/xeeshan16/agent-replay/actions/workflows/ci.yml)
 
 **Record, replay and regression-gate AI agent trajectories.**
 
@@ -64,7 +64,7 @@ Solid lines exist today; dotted lines are planned (see the plan).
 ## Quick start
 
 ```bash
-cd projects/01-agent-replay
+git clone https://github.com/xeeshan16/agent-replay && cd agent-replay
 uv venv -p 3.12 && uv pip install -e '.[dev]'   # or: python -m venv .venv && pip install -e '.[dev]'
 
 # Record a run of the reference agent

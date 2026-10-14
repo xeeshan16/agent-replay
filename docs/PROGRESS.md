@@ -4,7 +4,7 @@
 
 **Shipped**
 
-- Project layout under `projects/01-agent-replay` with `pyproject.toml` (hatchling), ruff (incl.
+- Project layout with `pyproject.toml` (hatchling), ruff (incl.
   bandit, async and pylint rule sets), mypy `--strict` with the pydantic plugin, pytest +
   pytest-asyncio + coverage.
 - `model.py`: frozen pydantic v2 trajectory model (`LLMStep` / `ToolStep` discriminated union,
@@ -26,3 +26,8 @@ coverage; `agent-replay demo` reports 5/5 sample runs identical under both repla
 provider).
 
 **Next (Day 2)**: OTLP JSON ingest and the PostgreSQL store with idempotent ingest.
+
+## Day 1 (follow-up) — 2026-10-14: standalone repository
+
+- Moved from `ai-engineering-lab/projects/01-agent-replay` into its own repository with full
+  history; CI now runs from the repository root (`.github/workflows/ci.yml`).

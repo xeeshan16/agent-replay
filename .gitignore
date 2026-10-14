@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+junit*.xml
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Local run artefacts
+*.local.json
+.agent-replay/
+
+# Editors and local assistant configuration
+.vscode/
+.idea/
+*.swp
+.DS_Store
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursor/
+.cursorrules
+.aider*
+.copilot/
