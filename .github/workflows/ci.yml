@@ -61,3 +61,9 @@ jobs:
       - name: Replay smoke test
         run: agent-replay demo --out-dir "$RUNNER_TEMP/demo"
 
+      - name: Ingest smoke test (OTLP file into PostgreSQL)
+        run: |
+          agent-replay record --task "Please refund ORD-1003." \
+            --out "$RUNNER_TEMP/run.json" --otlp-out "$RUNNER_TEMP/spans.json"
+          agent-replay ingest "$RUNNER_TEMP/spans.json" --database-url "$AGENT_REPLAY_TEST_DATABASE_URL"
+          agent-replay stats --database-url "$AGENT_REPLAY_TEST_DATABASE_URL"
