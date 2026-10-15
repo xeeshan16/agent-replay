@@ -1,3 +1,7 @@
 # Architecture decision records
 
-ADRs are added as decisions are made; the full set lands by Day 7.
+| ADR | Decision |
+|-----|----------|
+| [0001](0001-content-addressed-cassette.md) | Content-addressed cassette with strict matching |
+| [0002](0002-otlp-ingest-span-buffer.md) | OTLP ingest through a span buffer with whole-trace re-assembly |
+| [0003](0003-message-level-blob-storage.md) | Message-level content-addressed blobs in PostgreSQL |

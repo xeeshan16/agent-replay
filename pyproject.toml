@@ -17,6 +17,8 @@ dependencies = [
   "opentelemetry-proto>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-common>=1.27,<2",
   "protobuf>=5,<8",
+  "sqlalchemy[asyncio]>=2.0.30,<3",
+  "asyncpg>=0.29",
 ]
 
 [project.optional-dependencies]
@@ -70,10 +72,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-filterwarnings = [
-  # starlette's test client prefers the httpx2 fork; httpx is what the OTel stack already uses.
-  "ignore:Using `httpx` with `starlette.testclient` is deprecated",
-]
+
 markers = [
   "integration: tests that exercise several components end to end",
   "postgres: tests that need a PostgreSQL server (AGENT_REPLAY_TEST_DATABASE_URL)",

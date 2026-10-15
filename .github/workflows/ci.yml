@@ -17,6 +17,24 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_replay
+          POSTGRES_PASSWORD: agent_replay
+          POSTGRES_DB: agent_replay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_replay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AGENT_REPLAY_TEST_DATABASE_URL: postgresql://agent_replay:agent_replay@localhost:5432/agent_replay_test
+      # Fail instead of silently skipping the PostgreSQL tests if the service is missing.
+      AGENT_REPLAY_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -42,3 +60,4 @@ jobs:
 
       - name: Replay smoke test
         run: agent-replay demo --out-dir "$RUNNER_TEMP/demo"
+
