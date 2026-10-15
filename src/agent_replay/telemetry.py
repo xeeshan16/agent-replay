@@ -8,7 +8,7 @@ can map third-party spans back onto the trajectory model.
 from __future__ import annotations
 
 from opentelemetry import trace
-from opentelemetry.trace import Tracer
+from opentelemetry.trace import Tracer, TracerProvider
 
 TRACER_NAME = "agent_replay"
 
@@ -25,13 +25,24 @@ CONVERSATION_ID = "gen_ai.conversation.id"
 TOOL_NAME = "gen_ai.tool.name"
 TOOL_CALL_ID = "gen_ai.tool.call.id"
 ERROR_TYPE = "error.type"
+REQUEST_TEMPERATURE = "gen_ai.request.temperature"
+
+# Opt-in content attributes (see ``agent_replay.genai``).
+SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions"
+INPUT_MESSAGES = "gen_ai.input.messages"
+OUTPUT_MESSAGES = "gen_ai.output.messages"
+TOOL_DEFINITIONS = "gen_ai.tool.definitions"
+TOOL_CALL_ARGUMENTS = "gen_ai.tool.call.arguments"
+TOOL_CALL_RESULT = "gen_ai.tool.call.result"
 
 # Project-specific attributes.
 COST_USD = "agent_replay.cost_usd"
 STEP_INDEX = "agent_replay.step.index"
 REPLAY_MODE = "agent_replay.replay.mode"
 TOOL_SIDE_EFFECT = "agent_replay.tool.side_effect"
+TRAJECTORY_ID = "agent_replay.trajectory.id"
 
 
-def get_tracer() -> Tracer:
-    return trace.get_tracer(TRACER_NAME)
+def get_tracer(provider: TracerProvider | None = None) -> Tracer:
+    """Tracer from ``provider``, or from the globally configured provider when ``None``."""
+    return trace.get_tracer(TRACER_NAME, tracer_provider=provider)
