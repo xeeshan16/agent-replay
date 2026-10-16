@@ -34,17 +34,13 @@ from agent_replay.ingest.spans import decode_json, decode_protobuf
 from agent_replay.logs import configure_logging
 from agent_replay.matching import MatchMode, MatchPolicy
 from agent_replay.model import Trajectory
-from agent_replay.providers.fake import Policy
 from agent_replay.recorder import record_run
 from agent_replay.reference import support_desk
 from agent_replay.replay import ReplayMode, ReplayResult, replay
 from agent_replay.sandbox import SandboxPolicy, UnrecordedWrites
 from agent_replay.store import open_store
 
-POLICIES: dict[str, Policy] = {
-    "v1": support_desk.policy_v1,
-    "skip-lookup": support_desk.policy_skip_lookup,
-}
+POLICIES = support_desk.POLICIES
 
 EXIT_OK = 0
 EXIT_DIVERGED = 1
@@ -106,6 +102,7 @@ async def _replay(args: argparse.Namespace) -> int:
     policy = MatchPolicy(
         mode=MatchMode(args.match),
         threshold=args.threshold,
+        normalizer=support_desk.NORMALIZER,
         fuzzy_writes=args.fuzzy_writes,
     )
     sandbox = SandboxPolicy(
@@ -136,11 +133,20 @@ async def _demo(args: argparse.Namespace) -> int:
             agent, task, clock=TickingClock(), trajectory_id=f"demo-{index:02d}"
         )
         (out_dir / f"demo-{index:02d}.json").write_text(recording.to_json(), encoding="utf-8")
+        policy = support_desk.match_policy()
         full = await replay(
-            support_desk.build_agent(), recording, mode=ReplayMode.FULL, clock=TickingClock()
+            support_desk.build_agent(),
+            recording,
+            mode=ReplayMode.FULL,
+            clock=TickingClock(),
+            policy=policy,
         )
         tools = await replay(
-            support_desk.build_agent(), recording, mode=ReplayMode.TOOLS, clock=TickingClock()
+            support_desk.build_agent(),
+            recording,
+            mode=ReplayMode.TOOLS,
+            clock=TickingClock(),
+            policy=policy,
         )
         ok = full.identical and tools.identical
         failures += 0 if ok else 1
@@ -151,6 +157,7 @@ async def _demo(args: argparse.Namespace) -> int:
                 "tools": [s.call.name for s in recording.tool_steps],
                 "full_replay_identical": full.identical,
                 "tools_replay_identical": tools.identical,
+                "tools_replay_matches": tools.match_summary(),
                 "cost_usd": recording.usage.cost_usd,
             }
         )

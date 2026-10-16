@@ -11,7 +11,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from agent_replay.ingest.spans import SpanRecord, decode_protobuf
 from agent_replay.model import Trajectory
-from agent_replay.providers.fake import Policy
 from agent_replay.recorder import record_run
 from agent_replay.reference import support_desk
 
@@ -21,7 +20,7 @@ REFUND_TASK = "I'd like a refund for ORD-1001, it arrived damaged."
 async def record_with_spans(
     task: str = REFUND_TASK,
     *,
-    policy: Policy = support_desk.policy_v1,
+    policy: support_desk.DeskPolicy = support_desk.policy_v1,
     capture_content: bool = True,
 ) -> tuple[Trajectory, tuple[ReadableSpan, ...]]:
     exporter = InMemorySpanExporter()

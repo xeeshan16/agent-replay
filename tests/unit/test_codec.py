@@ -12,9 +12,9 @@ from agent_replay.store import codec
 
 
 async def _record(task: str, trajectory_id: str) -> Trajectory:
-    return await record_run(
-        support_desk.build_agent(), task, clock=TickingClock(), trajectory_id=trajectory_id
-    )
+    # A fixed prompt clock and seeded refund keys make repeated runs byte-identical in content.
+    agent = support_desk.build_agent(clock=TickingClock(), id_factory=support_desk.seeded_ids())
+    return await record_run(agent, task, clock=TickingClock(), trajectory_id=trajectory_id)
 
 
 async def test_encode_decode_is_lossless() -> None:

@@ -328,11 +328,14 @@ async def replay[A: Agent](
             "sandbox": sandbox_policy.describe(),
         },
     )
+    unconsumed = cassette.remaining()
+    if mode is ReplayMode.TOOLS:
+        del unconsumed["llm"]  # the model was live; recorded responses are not served
     return ReplayResult(
         original=recording,
         replayed=replayed,
         mode=mode,
-        unconsumed=cassette.remaining(),
+        unconsumed=unconsumed,
         policy=match_policy,
         sandbox=sandbox_policy,
         matches=tuple(cassette.events),

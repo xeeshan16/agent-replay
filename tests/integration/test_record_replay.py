@@ -44,7 +44,7 @@ async def test_replay_never_executes_side_effecting_tools() -> None:
     replay_store = support_desk.OrderStore()
     result = await replay(support_desk.build_agent(store=replay_store), recording)
     assert result.identical
-    assert replay_store.refunds == []
+    assert replay_store.refunds == {}
 
 
 async def test_regressed_agent_diverges_at_the_unrecorded_call() -> None:
