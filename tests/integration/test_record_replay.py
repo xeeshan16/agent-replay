@@ -55,8 +55,9 @@ async def test_regressed_agent_diverges_at_the_unrecorded_call() -> None:
     assert not result.identical
     assert result.replayed.status is RunStatus.ERROR
     assert result.replayed.error is not None
-    assert result.replayed.error.startswith("CassetteMissError")
+    assert result.replayed.error.startswith("SideEffectBlockedError")
     assert "issue_refund" in result.replayed.error
+    assert [e.outcome.value for e in result.matches] == ["blocked"]
     # The run stopped right after the model asked for the unrecorded refund.
     assert len(result.replayed.steps) == 1
 
@@ -121,3 +122,24 @@ def test_cli_record_and_replay_exit_codes(
 
     assert main(["demo", "--out-dir", str(tmp_path / "demo")]) == EXIT_OK
     assert len(list((tmp_path / "demo").glob("demo-*.json"))) == len(support_desk.SAMPLE_TASKS)
+
+
+def test_cli_replay_reports_matches_and_sandbox_decisions(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = tmp_path / "run.json"
+    assert main(["record", "--task", REFUND_TASK, "--out", str(run)]) == EXIT_OK
+    capsys.readouterr()
+
+    args = ["replay", str(run), "--policy", "skip-lookup", "--unrecorded-writes", "block"]
+    assert main(args) == EXIT_DIVERGED
+    report = json.loads(capsys.readouterr().out)
+    assert report["sandbox"] == {"live_reads": False, "unrecorded_writes": "block"}
+    assert report["matches"] == {"blocked": 1, "exact": 1}
+    # The blocked refund did not end the run: the agent went on to look the order up.
+    assert report["replayed"]["status"] == "success"
+    assert report["replayed"]["tool_calls"] == ["issue_refund", "lookup_order"]
+
+    fuzzy = ["replay", str(run), "--match", "fuzzy", "--threshold", "0.95"]
+    assert main(fuzzy) == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["match_policy"]["mode"] == "fuzzy"

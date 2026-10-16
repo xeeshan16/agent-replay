@@ -2,6 +2,7 @@
 
     agent-replay record --task "Please refund ORD-1001" --out run.json
     agent-replay replay run.json --mode tools --policy skip-lookup
+    agent-replay replay run.json --match fuzzy --threshold 0.9 --live-reads
     agent-replay demo --out-dir runs/
     agent-replay record --task "..." --out run.json --otlp-out spans.json
     agent-replay ingest spans.json            # into AGENT_REPLAY_DATABASE_URL, or memory
@@ -31,11 +32,13 @@ from agent_replay.ingest.export import spans_to_otlp_json
 from agent_replay.ingest.service import ingest_batch
 from agent_replay.ingest.spans import decode_json, decode_protobuf
 from agent_replay.logs import configure_logging
+from agent_replay.matching import MatchMode, MatchPolicy
 from agent_replay.model import Trajectory
 from agent_replay.providers.fake import Policy
 from agent_replay.recorder import record_run
 from agent_replay.reference import support_desk
 from agent_replay.replay import ReplayMode, ReplayResult, replay
+from agent_replay.sandbox import SandboxPolicy, UnrecordedWrites
 from agent_replay.store import open_store
 
 POLICIES: dict[str, Policy] = {
@@ -66,7 +69,12 @@ def _replay_report(result: ReplayResult) -> dict[str, object]:
     return {
         "mode": result.mode.value,
         "identical": result.identical,
+        "byte_identical": result.byte_identical,
         "unconsumed": result.unconsumed,
+        "match_policy": result.policy.describe(),
+        "sandbox": result.sandbox.describe(),
+        "matches": result.match_summary(),
+        "events": [event.to_json() for event in result.matches],
         "original": _summary(result.original),
         "replayed": _summary(result.replayed),
     }
@@ -95,7 +103,22 @@ async def _record(args: argparse.Namespace) -> int:
 async def _replay(args: argparse.Namespace) -> int:
     recording = Trajectory.from_json(Path(args.recording).read_bytes())
     agent = support_desk.build_agent(policy=POLICIES[args.policy])
-    result = await replay(agent, recording, mode=ReplayMode(args.mode), clock=TickingClock())
+    policy = MatchPolicy(
+        mode=MatchMode(args.match),
+        threshold=args.threshold,
+        fuzzy_writes=args.fuzzy_writes,
+    )
+    sandbox = SandboxPolicy(
+        live_reads=args.live_reads, unrecorded_writes=UnrecordedWrites(args.unrecorded_writes)
+    )
+    result = await replay(
+        agent,
+        recording,
+        mode=ReplayMode(args.mode),
+        clock=TickingClock(),
+        policy=policy,
+        sandbox=sandbox,
+    )
     if args.out:
         Path(args.out).write_text(result.replayed.to_json(), encoding="utf-8")
     print(json.dumps(_replay_report(result), indent=2))
@@ -197,6 +220,24 @@ def build_parser() -> argparse.ArgumentParser:
     rep.add_argument("--mode", choices=[m.value for m in ReplayMode], default="tools")
     rep.add_argument("--policy", choices=sorted(POLICIES), default="v1")
     rep.add_argument("--out", help="write the replayed trajectory here")
+    rep.add_argument("--match", choices=[m.value for m in MatchMode], default="strict")
+    rep.add_argument(
+        "--threshold", type=float, default=0.9, help="minimum similarity for --match fuzzy"
+    )
+    rep.add_argument(
+        "--fuzzy-writes",
+        action="store_true",
+        help="let side-effecting tools match fuzzily too (unsafe: hides argument drift)",
+    )
+    rep.add_argument(
+        "--live-reads", action="store_true", help="run unrecorded read-only tools live"
+    )
+    rep.add_argument(
+        "--unrecorded-writes",
+        choices=[u.value for u in UnrecordedWrites],
+        default="fail",
+        help="fail the run, or block the call and let the agent continue",
+    )
 
     demo = sub.add_parser("demo", help="record and replay every sample task")
     demo.add_argument("--out-dir", default=".agent-replay/demo")
