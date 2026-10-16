@@ -4,7 +4,7 @@
 
 **Record, replay and regression-gate AI agent trajectories.**
 
-> Status: 🚧 in progress (day 2 of 7). See [docs/PLAN.md](docs/PLAN.md) and
+> Status: 🚧 in progress (day 3 of 7). See [docs/PLAN.md](docs/PLAN.md) and
 > [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## The problem
@@ -34,8 +34,14 @@ flowchart LR
     AS --> T
     T --> S[(PostgreSQL<br/>headers, steps,<br/>content-addressed blobs)]
     S --> C[Cassette]
-    C --> RP[Replayer<br/>FULL / TOOLS mode]
+    N[Normaliser chain] --> M[Matcher<br/>exact → normalized → fuzzy]
+    C --> M
+    M --> RP[Replayer<br/>FULL / TOOLS mode]
     A2[New agent version] --> RP
+    RP -- every tool call --> SB{Sandbox}
+    SB -- recorded --> M
+    SB -- unrecorded read<br/>--live-reads --> LT[Live read-only tools]
+    SB -- unrecorded write --> BL[Blocked: fail or error result]
     RP --> T2[(Replayed trajectory)]
     T2 -.-> D[Diff: first divergence]
     T2 -.-> SC[Layered scoring<br/>checks → invariants → judge]
@@ -56,11 +62,27 @@ Solid lines exist today; dotted lines are planned (see the plan).
   retries with full-jitter exponential backoff, fail-fast on non-retryable errors).
 - **Recorder** (`recorder.py`): wraps any agent's provider and tool executor, emits OTel GenAI
   spans with token and cost attributes, and returns a `Trajectory`, also for failed runs.
-- **Replayer** (`replay.py`): content-addressed cassette (canonical request → response, FIFO for
-  repeats), `FULL` and `TOOLS` modes, strict matching that fails at the exact divergence point,
-  and no real tool is executed during replay.
-- **Reference agent** (`reference/support_desk.py`): a support-desk agent with a read tool and a
-  side-effecting refund tool, plus a seeded regression policy.
+- **Replayer** (`replay.py`): content-addressed cassette (FIFO for repeated identical calls),
+  `FULL` and `TOOLS` modes, and a per-request match log. A request that cannot be served ends
+  the run at the exact divergence point.
+- **Normaliser chain** (`normalize.py`): masks timestamps, UUIDs and provider call IDs, drops
+  volatile keys and sorts lists declared unordered, in one walk with placeholders indexed by
+  first appearance (`<uuid:0>`), so identity survives while the concrete value is ignored.
+- **Tiered matching** (`matching.py`): `exact` → `normalized` → opt-in `fuzzy` (closest
+  unconsumed recording of the same tool or model by structural similarity, threshold 0.9 by
+  default). Writes never match fuzzily unless `fuzzy_writes` is set. "Identical" means equal
+  after normalisation; `byte_identical` keeps the raw comparison.
+- **Side-effect sandbox** (`sandbox.py`): every replayed tool call goes through it. Unrecorded
+  reads miss, or run live with `--live-reads`; unrecorded writes are never executed and either
+  fail the run or return an error result to the agent (`--unrecorded-writes block`). A tool is a
+  write if its spec, the recording, or the absence of a spec says so. See
+  [ADR 0004](docs/adr/0004-tiered-matching-and-side-effect-sandbox.md).
+- **Reference agent** (`reference/support_desk.py`): a support-desk agent with two reads
+  (`lookup_order`, `get_refund_policy`) and two writes (`issue_refund`, idempotent per key, and
+  `create_ticket`). It retries a transient lookup failure, escalates refunds over a limit to a
+  ticket, and carries realistic volatile values (the time in its system prompt, a fresh
+  idempotency key per refund, ticket tags built from a set). Controlled variants: `skip-lookup`,
+  `no-retry` and `amount-drift` (regressions) and `check-policy` (a benign extra read).
 - **Cost accounting**: deterministic token estimation for the fake provider and a configurable
   price table.
 - **OTLP receiver** (`server.py`, `ingest/`): `POST /v1/traces` accepts OTLP/HTTP protobuf and
@@ -95,6 +117,15 @@ agent-replay replay run.json --mode full
 
 # Replay a regressed agent version against the recorded tools: diverges, exit 1
 agent-replay replay run.json --mode tools --policy skip-lookup
+
+# Let the run continue past the blocked write so the whole trajectory can be inspected
+agent-replay replay run.json --policy skip-lookup --unrecorded-writes block
+
+# A benign change that adds a read: replays with live reads (the refund is still never executed)
+agent-replay replay run.json --policy check-policy --live-reads
+
+# Tolerate small argument drift on reads; writes still match exactly
+agent-replay replay run.json --match fuzzy --threshold 0.9
 
 # Record and replay every sample task
 agent-replay demo
@@ -143,8 +174,17 @@ AGENT_REPLAY_TEST_DATABASE_URL=postgresql://agent_replay:agent_replay@localhost:
 
 ## Security notes
 
-- Replay never executes real tools; side-effecting tools (`side_effect=True`) are flagged in the
-  trajectory and on spans so later scoring can treat any new write as unsafe.
+- Replay never executes a side-effecting tool. Read-only tools run live only with
+  `--live-reads` and only on a cassette miss. Classification fails closed: a tool is treated as
+  a write if its spec says so, if the recording flagged it, or if it has no spec, so relabelling
+  a recorded write as read-only in a new agent version does not unlock it. The sandbox enforces
+  the `side_effect` flag; it cannot verify it, so a tool that writes must be registered as such.
+- Fuzzy matching is off by default and never applies to writes unless `--fuzzy-writes` is given:
+  serving a recorded refund for a request with a different amount would hide argument drift on
+  exactly the calls that matter. Every fuzzy match is reported with its similarity score.
+- Normalisation can hide real differences if a rule is too broad (masking every number, say).
+  The defaults only mask timestamps, UUIDs and provider call IDs, bare dates are kept, and the
+  match log shows which steps needed normalisation.
 - Recorded trajectories contain full prompts and tool outputs. Treat stored recordings with the
   same data classification as the production data they came from; redaction at ingest is planned.
 - Content capture on spans is **off by default** (`AGENT_REPLAY_CAPTURE_CONTENT`), matching the

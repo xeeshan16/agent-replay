@@ -66,3 +66,58 @@ Measured on the five sample runs ingested into PostgreSQL: 19,805 logical bytes 
 blob bytes (1.77x); a second ingest of the same files inserted 0 spans and changed nothing.
 
 **Next (Day 3)**: normaliser chain, fuzzy matching and the side-effect sandbox for replay.
+
+## Day 3 — 2026-10-16: replay engine, hardened
+
+**Shipped**
+
+- `normalize.py`: an immutable rule chain applied in one walk: masks for ISO-8601 timestamps
+  (bare dates kept by default), UUIDs and provider tool-call IDs, `DropKeys`, and `SortLists`
+  for lists declared unordered. Indexed placeholders by first appearance keep identity
+  (`<uuid:0>` passed back stays `<uuid:0>`) while ignoring the value; numbering follows sorted
+  keys and, inside unordered lists, the sorted order, so it never depends on arrival order.
+- `matching.py`: `MatchPolicy` (strict or fuzzy, threshold, normaliser, `fuzzy_writes`), a
+  model-free structural `similarity` over JSON, and `MatchEvent` records.
+- `replay.py`: the cassette matches exact → normalised → (opt-in) fuzzy, keeps FIFO for
+  repeated calls even when a fuzzy match consumed an entry out of order, logs one event per
+  request, and names the closest unconsumed recording and its score on a miss.
+  `ReplayResult.identical` compares normalised fingerprints; `byte_identical` keeps the raw one.
+- `sandbox.py`: every replayed tool call goes through `SandboxedTools`. Unrecorded reads miss or
+  run live (`live_reads`); unrecorded writes are never executed and either fail the run
+  (`SideEffectBlockedError`) or return an error result so the run continues. Tools the agent
+  does not offer fail as they would live. Write classification fails closed (spec, recording,
+  or no spec).
+- Reference agent: current time in the system prompt, an idempotent `issue_refund` with a fresh
+  key per call, `get_refund_policy`, `create_ticket` (minted ticket ID and timestamp, tags from a
+  set), a retried transient lookup failure (ORD-1004) and a refund over the auto-refund limit
+  escalated to a ticket (ORD-1005). Variants `no-retry`, `amount-drift` and `check-policy` join
+  `skip-lookup`; the agent ships its own normaliser (defaults + unordered `tags`).
+- CLI: `replay --match {strict,fuzzy} --threshold --fuzzy-writes --live-reads
+  --unrecorded-writes {fail,block}`; the report includes the match policy, sandbox policy, an
+  outcome summary and the per-request events.
+- ADR 0004 (tiered matching and the fail-closed sandbox).
+
+**Verified locally** (Python 3.12, PostgreSQL 16, fake provider): ruff and format clean, mypy
+strict clean (60 files), 177 tests passing including the PostgreSQL tests, 97% line coverage.
+
+Measured on the 7 sample tasks, recording in one process and replaying in another (different
+`PYTHONHASHSEED`, at least one second apart), 5 seed pairs, so 35 replays per cell, counting
+runs reported identical:
+
+| Normaliser | FULL replay | TOOLS replay |
+|------------|-------------|--------------|
+| none (Day 1 strict matching) | 0 / 35 | 20 / 35 |
+| default (timestamps, UUIDs, call IDs) | 35 / 35 | 31 / 35 |
+| support-desk (default + unordered `tags`) | 35 / 35 | 35 / 35 |
+
+FULL replay without normalisation always misses because the system prompt carries the time;
+TOOLS replay misses on the fresh idempotency key; the 4 remaining default-normaliser misses are
+the ticket tags coming out of the set in another order (the tags matched by chance in one seed
+pair).
+
+**Plan adjustment**: none to the milestones. The match events are designed as Day 4's input:
+the diff can align on `recorded_index` and report fuzzy, live and blocked steps as divergence
+reasons.
+
+**Next (Day 4)**: trajectory diff — alignment of tool-call sequences with argument-aware
+substitution cost, first-divergence detection with a reason, CLI and Markdown rendering.
