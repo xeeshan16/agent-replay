@@ -4,7 +4,7 @@
 
 **Record, replay and regression-gate AI agent trajectories.**
 
-> Status: 🚧 in progress (day 3 of 7). See [docs/PLAN.md](docs/PLAN.md) and
+> Status: 🚧 in progress (day 4 of 7). See [docs/PLAN.md](docs/PLAN.md) and
 > [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## The problem
@@ -43,7 +43,9 @@ flowchart LR
     SB -- unrecorded read<br/>--live-reads --> LT[Live read-only tools]
     SB -- unrecorded write --> BL[Blocked: fail or error result]
     RP --> T2[(Replayed trajectory)]
-    T2 -.-> D[Diff: first divergence]
+    T --> D[Diff<br/>alignment + reasons]
+    T2 --> D
+    D --> MD[Markdown / JSON<br/>first divergence]
     T2 -.-> SC[Layered scoring<br/>checks → invariants → judge]
     D -.-> G[CI gate]
     SC -.-> G
@@ -83,6 +85,16 @@ Solid lines exist today; dotted lines are planned (see the plan).
   ticket, and carries realistic volatile values (the time in its system prompt, a fresh
   idempotency key per refund, ticket tags built from a set). Controlled variants: `skip-lookup`,
   `no-retry` and `amount-drift` (regressions) and `check-policy` (a benign extra read).
+- **Trajectory diff** (`diff.py`, `report.py`): turns both runs into the tool calls the model
+  requested (including calls the sandbox refused, which never became tool steps), normalises
+  them with the replay normaliser and aligns them with a weighted edit distance whose
+  substitution cost is argument-aware, so a refund with a drifted amount lines up with the
+  recorded refund instead of reading as one call removed and another added. Each difference gets
+  a reason (`wrong_tool`, `argument_drift` with the JSON paths that changed, `output_drift`,
+  `missing_step`, `extra_step`, `extra_loop`, `status_changed`, `different_answer`), and the
+  first divergence names the candidate model call that made the choice. Rendered as Markdown
+  (escaped for PR comments and CI summaries) or JSON; `replay` annotates each call with how it
+  was served (normalised, fuzzy, live, blocked).
 - **Cost accounting**: deterministic token estimation for the fake provider and a configurable
   price table.
 - **OTLP receiver** (`server.py`, `ingest/`): `POST /v1/traces` accepts OTLP/HTTP protobuf and
@@ -129,6 +141,23 @@ agent-replay replay run.json --match fuzzy --threshold 0.9
 
 # Record and replay every sample task
 agent-replay demo
+
+# Where and why did it diverge? Markdown diff with the first divergence and an aligned table
+agent-replay replay run.json --policy amount-drift --diff-out diff.md
+
+# Diff any two saved trajectories (exit 1 if they differ; --format json for machines)
+agent-replay record --task "I'd like a refund for ORD-1001, it arrived damaged." --out again.json
+agent-replay diff run.json again.json
+```
+
+Excerpt of `diff.md` from the `amount-drift` replay above (real output, line-wrapped):
+
+```markdown
+**First divergence:** `argument_drift`: called issue_refund with different arguments
+(requested, never executed) [replay: blocked] (baseline step 3, decided at candidate model step 2)
+
+> **Involves a side-effecting tool.**
+- amount: 59.9 → 60.0
 ```
 
 No API keys are needed; the default provider is the deterministic fake.
@@ -161,6 +190,20 @@ the instrumentation to get replayable trajectories. Stored runs are readable at
 | `AGENT_REPLAY_INGEST_TOKEN` | unset (open) | Require `Authorization: Bearer <token>` on `POST /v1/traces` |
 | `AGENT_REPLAY_CAPTURE_CONTENT` | `false` | Put prompts, tool arguments and results on recorder spans |
 | `AGENT_REPLAY_LOG_LEVEL` | `WARNING` | JSON log level |
+
+## Design trade-offs
+
+- **Diff actions, not messages.** The diff aligns tool calls and compares the outcome; it does
+  not align intermediate model text, which changes with every prompt edit. Wording quality is a
+  scoring concern (Day 5), localisation is the diff's.
+- **Edit distance with forward tracing.** The alignment table is filled from the end and traced
+  from the start, preferring a substitution, then a deletion, then an insertion on ties. That
+  makes the *later* of two equal calls the extra one, which is how a retry loop reads. A rename
+  costs 1.5 (less than delete + insert = 2), so "called the wrong tool here" wins over "dropped
+  one tool and added another"; same-tool substitutions cost at most 1. The costs are
+  configurable (`DiffCosts`) and validated so these orderings always hold.
+- **O(n·m) alignment** with a cell cap (`max_cells`, 1M by default) so a pathological pair fails
+  fast. Measured on this project's synthetic actions: 200 x 200 actions diff in about 40 ms.
 
 ## Development
 
@@ -195,6 +238,10 @@ AGENT_REPLAY_TEST_DATABASE_URL=postgresql://agent_replay:agent_replay@localhost:
   behind TLS termination; it does not terminate TLS itself.
 - Traces with no GenAI spans are dropped at the door so a misrouted collector cannot fill the
   span buffer with unrelated telemetry.
+- Diff reports quote tool arguments and outputs, which are untrusted. The Markdown renderer
+  flattens, truncates and escapes every cell (pipes, angle brackets, backticks), so recorded
+  content cannot break the table or inject markup into a PR comment or CI summary. Reports carry
+  recorded data: publish them with the same care as the recordings.
 - Recorded tool outputs are untrusted input to the agent under test (they may contain prompt
   injection captured from the real world); replay reproduces them faithfully on purpose.
 

@@ -121,3 +121,68 @@ reasons.
 
 **Next (Day 4)**: trajectory diff — alignment of tool-call sequences with argument-aware
 substitution cost, first-divergence detection with a reason, CLI and Markdown rendering.
+
+## Day 4 — 2026-10-17: trajectory diff
+
+**Shipped**
+
+- `diff.py`: a trajectory becomes *actions*, one per tool call the model requested, joined to
+  the tool step that executed it. Calls that never ran (a cassette miss, a write the sandbox
+  refused) are still actions, marked `executed: false`, so the diff shows the refused refund and
+  not only what happened before it. Traces ingested without content (no requested calls on model
+  steps) fall back to their tool steps.
+- Both sides are normalised in one scope each, in action order, with the replay normaliser.
+- Alignment: weighted edit distance (delete 1, insert 1, rename 1.5, same-tool substitution
+  `0.8·(1 − sim(args)) + 0.2·(1 − sim(result))` using the Day 3 structural similarity), filled
+  from the end and traced forward so the later of two equal calls is the extra one. `DiffCosts`
+  validates that a rename and a same-tool substitution always beat delete + insert, and caps the
+  table size.
+- Reasons: `wrong_tool`, `argument_drift` (leaf JSON paths with before/after), `output_drift`,
+  `missing_step`, `extra_step`, `extra_loop` (an inserted exact repeat), `status_changed`,
+  `different_answer`. Each divergence carries baseline and candidate step indices, whether a
+  write is involved, and the *decision step*: the candidate model call that made the choice (for
+  a missing call, the first model call after the last aligned candidate action).
+- Replay provenance: match events annotate candidate actions (exact, normalised, fuzzy, live,
+  blocked, unknown tool) and appear in divergence summaries.
+- `report.py`: GitHub-flavoured Markdown (verdict, first divergence, aligned table, outcome,
+  usage delta). Cells are flattened, truncated and escaped so untrusted tool output cannot break
+  the table or inject markup; covered by a test with a hostile tool output.
+- CLI: `agent-replay diff BASELINE CANDIDATE [--format md|json] [--normalizer ...] [--out]`
+  (exit 1 on divergence); `replay` reports `first_divergence` and per-reason counts and writes
+  the Markdown diff with `--diff-out`. CI runs a diff smoke test and publishes the diff to the
+  job summary.
+- The support-desk normaliser now also masks refund IDs (`RF-xxxxxxxx`, indexed): they are
+  derived from the per-call idempotency key, so two independent live runs always differed on
+  them. Replay results are unaffected (replayed tool outputs come from the cassette).
+
+**Verified locally** (Python 3.12, PostgreSQL 16, fake provider): ruff and format clean, mypy
+strict clean (65 files), 225 tests passing including the PostgreSQL tests, 97% line coverage
+(`diff.py` 99%). A brute-force test checks the alignment is minimal for every pair of action
+sequences up to length 3 over a 4-call pool.
+
+Measured on the 7 sample tasks x 5 policies in TOOLS replay with live reads, recording in one
+process and diffing in another (3 seed pairs, different `PYTHONHASHSEED`): the first divergence
+was the same in all 3 runs for all 35 cells. Every `v1` replay diffs identical; the regressions
+are localised as follows (reason: tool @ candidate decision step):
+
+| Task | skip-lookup | no-retry | amount-drift | check-policy |
+|------|-------------|----------|--------------|--------------|
+| refund ORD-1001 | missing_step: lookup_order @0 | identical | argument_drift: issue_refund @2 (`amount` 59.9 → 60.0) | extra_step: get_refund_policy @2 |
+| refund ORD-1003 (outside window) | wrong_tool: issue_refund @0 | identical | identical | extra_step: get_refund_policy @2 |
+| refund ORD-9999 (unknown) | wrong_tool: issue_refund @0 | identical | identical | identical |
+| refund ORD-1004 (transient failure) | missing_step: lookup_order @0 | missing_step: lookup_order @2 | identical | extra_step: get_refund_policy @4 |
+| refund ORD-1005 (over limit) | missing_step: lookup_order @0 | identical | identical | extra_step: get_refund_policy @2 |
+
+The two non-refund tasks diff identical under every policy, as they should: no variant changes
+their behaviour. "Identical" cells are policies whose change does not apply to that task (e.g.
+`amount-drift` on an order whose total is already whole, or that is never refunded). Diff time
+for 200 x 200 synthetic actions: about 40 ms on this machine.
+
+**Observation for Day 5**: `skip-lookup` reads as `wrong_tool` when the baseline made only the
+lookup (ORD-1003, ORD-9999) and as `missing_step` + `argument_drift` when the baseline also
+refunded. Both are correct alignments of the same regression; the Day 5 labelled dataset will
+label first divergences by position and tool, and accept either reason where the sequences make
+them equivalent, rather than tune costs to one reading.
+
+**Next (Day 5)**: layered scoring (deterministic checks → invariants DSL → optional LLM judge),
+per-run token and cost accounting, and the labelled dataset of seeded regressions.
