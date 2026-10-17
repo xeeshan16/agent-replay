@@ -1,6 +1,13 @@
 """Agent Replay: record, replay and regression-gate AI agent trajectories."""
 
 from agent_replay.agent import AgentRun, ToolCallingAgent
+from agent_replay.diff import (
+    DiffCosts,
+    Divergence,
+    DivergenceReason,
+    TrajectoryDiff,
+    diff_trajectories,
+)
 from agent_replay.matching import MatchMode, MatchOutcome, MatchPolicy
 from agent_replay.model import (
     LLMRequest,
@@ -16,11 +23,15 @@ from agent_replay.model import (
 from agent_replay.normalize import Normalizer
 from agent_replay.recorder import record_run
 from agent_replay.replay import Cassette, ReplayMode, ReplayResult, replay
+from agent_replay.report import render_markdown
 from agent_replay.sandbox import SandboxPolicy, UnrecordedWrites
 
 __all__ = [
     "AgentRun",
     "Cassette",
+    "DiffCosts",
+    "Divergence",
+    "DivergenceReason",
     "LLMRequest",
     "LLMResponse",
     "LLMStep",
@@ -37,9 +48,12 @@ __all__ = [
     "ToolResult",
     "ToolStep",
     "Trajectory",
+    "TrajectoryDiff",
     "UnrecordedWrites",
     "Usage",
+    "diff_trajectories",
     "record_run",
+    "render_markdown",
     "replay",
 ]
 

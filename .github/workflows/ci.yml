@@ -61,6 +61,21 @@ jobs:
       - name: Replay smoke test
         run: agent-replay demo --out-dir "$RUNNER_TEMP/demo"
 
+      - name: Diff smoke test (a seeded regression must diverge and be localised)
+        run: |
+          task="I'd like a refund for ORD-1001, it arrived damaged."
+          agent-replay record --task "$task" --out "$RUNNER_TEMP/base.json"
+          agent-replay record --task "$task" --out "$RUNNER_TEMP/again.json"
+          agent-replay diff "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/again.json"
+          set +e
+          agent-replay replay "$RUNNER_TEMP/base.json" --policy amount-drift \
+            --diff-out "$RUNNER_TEMP/diff.md" > "$RUNNER_TEMP/replay.json"
+          code=$?
+          set -e
+          test "$code" -eq 1
+          grep -q 'First divergence:\*\* `argument_drift`' "$RUNNER_TEMP/diff.md"
+          cat "$RUNNER_TEMP/diff.md" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Ingest smoke test (OTLP file into PostgreSQL)
         run: |
           agent-replay record --task "Please refund ORD-1003." \

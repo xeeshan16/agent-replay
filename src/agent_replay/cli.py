@@ -3,14 +3,16 @@
     agent-replay record --task "Please refund ORD-1001" --out run.json
     agent-replay replay run.json --mode tools --policy skip-lookup
     agent-replay replay run.json --match fuzzy --threshold 0.9 --live-reads
+    agent-replay replay run.json --policy amount-drift --diff-out diff.md
+    agent-replay diff baseline.json candidate.json --format md
     agent-replay demo --out-dir runs/
     agent-replay record --task "..." --out run.json --otlp-out spans.json
     agent-replay ingest spans.json            # into AGENT_REPLAY_DATABASE_URL, or memory
     agent-replay serve --port 4318            # OTLP/HTTP receiver + read API
     agent-replay stats
 
-``replay`` exits 0 when the replayed run is semantically identical to the recording and 1 when
-it diverged, so it can be used directly in CI.
+``replay`` and ``diff`` exit 0 when the runs are behaviourally identical and 1 when they
+diverged, so they can be used directly in CI.
 """
 
 from __future__ import annotations
@@ -28,19 +30,27 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from agent_replay.clock import TickingClock
+from agent_replay.diff import TrajectoryDiff, diff_trajectories
 from agent_replay.ingest.export import spans_to_otlp_json
 from agent_replay.ingest.service import ingest_batch
 from agent_replay.ingest.spans import decode_json, decode_protobuf
 from agent_replay.logs import configure_logging
 from agent_replay.matching import MatchMode, MatchPolicy
 from agent_replay.model import Trajectory
+from agent_replay.normalize import Normalizer
 from agent_replay.recorder import record_run
 from agent_replay.reference import support_desk
 from agent_replay.replay import ReplayMode, ReplayResult, replay
+from agent_replay.report import render_markdown
 from agent_replay.sandbox import SandboxPolicy, UnrecordedWrites
 from agent_replay.store import open_store
 
 POLICIES = support_desk.POLICIES
+NORMALIZERS: dict[str, Normalizer] = {
+    "none": Normalizer.none(),
+    "default": Normalizer.default(),
+    "support-desk": support_desk.NORMALIZER,
+}
 
 EXIT_OK = 0
 EXIT_DIVERGED = 1
@@ -61,7 +71,12 @@ def _summary(trajectory: Trajectory) -> dict[str, object]:
     }
 
 
-def _replay_report(result: ReplayResult) -> dict[str, object]:
+def _first_divergence(diff: TrajectoryDiff) -> dict[str, object] | None:
+    first = diff.first_divergence
+    return None if first is None else first.model_dump(mode="json", exclude_defaults=True)
+
+
+def _replay_report(result: ReplayResult, diff: TrajectoryDiff) -> dict[str, object]:
     return {
         "mode": result.mode.value,
         "identical": result.identical,
@@ -71,6 +86,8 @@ def _replay_report(result: ReplayResult) -> dict[str, object]:
         "sandbox": result.sandbox.describe(),
         "matches": result.match_summary(),
         "events": [event.to_json() for event in result.matches],
+        "first_divergence": _first_divergence(diff),
+        "divergences": diff.reason_counts(),
         "original": _summary(result.original),
         "replayed": _summary(result.replayed),
     }
@@ -116,10 +133,28 @@ async def _replay(args: argparse.Namespace) -> int:
         policy=policy,
         sandbox=sandbox,
     )
+    diff = diff_trajectories(
+        recording, result.replayed, normalizer=policy.normalizer, candidate_events=result.matches
+    )
     if args.out:
         Path(args.out).write_text(result.replayed.to_json(), encoding="utf-8")
-    print(json.dumps(_replay_report(result), indent=2))
+    if args.diff_out:
+        title = f"Replay ({result.mode.value} mode, policy {args.policy})"
+        Path(args.diff_out).write_text(render_markdown(diff, title=title), encoding="utf-8")
+    print(json.dumps(_replay_report(result, diff), indent=2))
     return EXIT_OK if result.identical else EXIT_DIVERGED
+
+
+async def _diff(args: argparse.Namespace) -> int:
+    baseline = Trajectory.from_json(Path(args.baseline).read_bytes())
+    candidate = Trajectory.from_json(Path(args.candidate).read_bytes())
+    diff = diff_trajectories(baseline, candidate, normalizer=NORMALIZERS[args.normalizer])
+    text = render_markdown(diff) if args.format == "md" else json.dumps(diff.to_report(), indent=2)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+    else:
+        print(text)
+    return EXIT_OK if diff.identical else EXIT_DIVERGED
 
 
 async def _demo(args: argparse.Namespace) -> int:
@@ -245,6 +280,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="fail",
         help="fail the run, or block the call and let the agent continue",
     )
+    rep.add_argument("--diff-out", help="write a Markdown diff against the recording here")
+
+    dif = sub.add_parser("diff", help="align two trajectories and explain the differences")
+    dif.add_argument("baseline")
+    dif.add_argument("candidate")
+    dif.add_argument("--format", choices=["md", "json"], default="md")
+    dif.add_argument("--normalizer", choices=sorted(NORMALIZERS), default="support-desk")
+    dif.add_argument("--out", help="write the diff here instead of standard output")
 
     demo = sub.add_parser("demo", help="record and replay every sample task")
     demo.add_argument("--out-dir", default=".agent-replay/demo")
@@ -272,6 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     handlers = {
         "record": _record,
         "replay": _replay,
+        "diff": _diff,
         "demo": _demo,
         "ingest": _ingest,
         "stats": _stats,

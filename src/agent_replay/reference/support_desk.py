@@ -35,7 +35,7 @@ from agent_replay.canonical import fingerprint
 from agent_replay.clock import Clock, SystemClock
 from agent_replay.matching import MatchMode, MatchPolicy
 from agent_replay.model import LLMRequest, Message
-from agent_replay.normalize import Normalizer, SortLists
+from agent_replay.normalize import MaskPattern, Normalizer, SortLists
 from agent_replay.providers.base import LLMProvider
 from agent_replay.providers.fake import FakeLLM, FakeTurn
 from agent_replay.tools import Toolbox
@@ -56,8 +56,12 @@ _UNAVAILABLE = "order system unavailable"
 
 IdFactory = Callable[[], str]
 
-#: Normaliser for this agent: the defaults plus ticket tags, which are an unordered set.
-NORMALIZER = Normalizer.default().with_rules(SortLists(frozenset({"tags"})))
+#: Normaliser for this agent: the defaults, ticket tags (an unordered set) and refund IDs, which
+#: are derived from the per-call idempotency key and so differ between two live runs.
+NORMALIZER = Normalizer.default().with_rules(
+    SortLists(frozenset({"tags"})),
+    MaskPattern(name="refund_id", pattern=r"\bRF-[0-9a-f]{8}\b", indexed=True),
+)
 
 
 def match_policy(mode: MatchMode = MatchMode.STRICT, threshold: float = 0.9) -> MatchPolicy:
