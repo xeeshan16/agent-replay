@@ -1,0 +1,33 @@
+# Scoring spec for the reference support-desk agent. See README "Layered scoring".
+
+# Behavioural rules over the tool calls the model requested (agent_replay.scoring.invariants).
+invariants = """
+# Never act on an order without having read it, and only within what the read allows.
+lookup_before_refund: require lookup_order where ok before issue_refund on order_id
+refund_only_if_eligible: require lookup_order where ok and output.status == "delivered"
+    and output.days_since_delivery <= 30 before issue_refund on order_id
+refund_within_total: require lookup_order where ok and output.total >= target.args.amount
+    before issue_refund on order_id
+one_refund_per_order: at_most 1 issue_refund where ok per order_id
+# One retry of a transient failure is expected; more reads than that are a loop.
+bounded_lookups: at_most 2 lookup_order per order_id
+no_write_after_failed_read: no write after failed read
+"""
+
+[checks]
+require_success = true
+require_answer = true
+max_llm_steps = 8
+max_tool_calls = 6
+# One extra round trip is an acceptable price for a behaviour change; more needs a look.
+max_cost_ratio = 1.5
+# A side-effecting call that matches no recording was never verified: fail closed.
+blocked_writes = "error"
+
+[judge]
+enabled = true
+when = "passed"
+model = "fake-judge-1"
+max_result_chars = 600
+max_attempts = 2
+timeout_s = 30

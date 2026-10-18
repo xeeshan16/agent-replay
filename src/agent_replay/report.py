@@ -1,4 +1,4 @@
-"""Markdown rendering of a ``TrajectoryDiff`` for terminals, PR comments and CI summaries.
+"""Markdown rendering of diffs and scorecards for terminals, PR comments and CI summaries.
 
 The output is GitHub-flavoured Markdown: a verdict line, the first divergence with its decision
 step, the aligned action table and the outcome. Cell content is escaped and truncated so that
@@ -13,6 +13,8 @@ from pydantic import JsonValue
 
 from agent_replay.canonical import canonical_json
 from agent_replay.diff import Action, AlignedPair, Change, DiffOp, Divergence, TrajectoryDiff
+from agent_replay.model import Usage
+from agent_replay.scoring.scorecard import Scorecard
 
 _OP_MARK = {DiffOp.MATCH: "=", DiffOp.SUBSTITUTE: "~", DiffOp.DELETE: "-", DiffOp.INSERT: "+"}
 _CELL = 90
@@ -139,4 +141,56 @@ def render_markdown(diff: TrajectoryDiff, *, title: str | None = None) -> str:
     if out.candidate_error:
         lines.extend(["", f"Candidate error: `{cell(out.candidate_error, 200)}`"])
     lines.extend(["", f"Normaliser: `{cell(', '.join(diff.normalizer) or 'none', 200)}`", ""])
+    return "\n".join(lines)
+
+
+_STATUS_MARK = {"passed": "pass", "failed": "**FAIL**", "skipped": "skipped", "inconclusive": "?"}
+
+
+def _usage(usage: Usage) -> str:
+    return f"{usage.input_tokens} in / {usage.output_tokens} out tokens, ${usage.cost_usd:.6f}"
+
+
+def render_scorecard(card: Scorecard, *, title: str | None = None) -> str:
+    """The verdict, one row per finding (failures first within each layer) and the costs."""
+    lines = [f"### {cell(title or 'Scorecard', 120)}", ""]
+    lines.append(
+        f"`{cell(card.trajectory_id, 80)}`"
+        + (f" scored against `{cell(card.baseline_id, 80)}`" if card.baseline_id else "")
+    )
+    failed = ", ".join(layer.value for layer in card.failed_layers)
+    lines.extend(
+        ["", f"**Verdict:** {card.verdict.value}" + (f" (failed: {failed})" if failed else "")]
+    )
+    lines.extend(
+        [
+            "",
+            "| Layer | Check | Result | Step | Detail |",
+            "|-------|-------|--------|------|--------|",
+        ]
+    )
+    for layer in card.layers:
+        if not layer.findings:
+            note = cell(layer.note or "", 60)
+            lines.append(f"| {layer.layer.value} | | {_STATUS_MARK[layer.status]} | | {note} |")
+            continue
+        for finding in sorted(layer.findings, key=lambda f: f.passed):
+            result = (
+                "pass"
+                if finding.passed
+                else ("**FAIL**" if finding.severity == "error" else "warn")
+            )
+            step = "" if finding.step is None else str(finding.step)
+            lines.append(
+                f"| {layer.layer.value} | {cell(finding.name, 40)} | {result} | {step} "
+                f"| {cell(finding.message)} |"
+            )
+    cost = card.cost
+    lines.extend(["", f"Agent: {_usage(cost.agent)}."])
+    if cost.baseline is not None:
+        ratio = "" if cost.ratio is None else f" ({cost.ratio:.2f}x)"
+        lines.append(f"Baseline: {_usage(cost.baseline)}{ratio}.")
+    if card.judge_attempts:
+        lines.append(f"Judge: {_usage(cost.judge)} over {card.judge_attempts} call(s).")
+    lines.append("")
     return "\n".join(lines)

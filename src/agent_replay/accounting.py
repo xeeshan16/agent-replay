@@ -13,7 +13,7 @@ from collections.abc import Iterable, Mapping
 
 from pydantic import BaseModel, ConfigDict
 
-from agent_replay.model import Message, Usage
+from agent_replay.model import Message, Trajectory, Usage
 
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
@@ -47,6 +47,18 @@ class PriceTable:
         self._prices = dict(prices)
         self._default = default
 
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Mapping[str, float]]) -> PriceTable:
+        """``{"model": {"input_per_mtok": 0.5, "output_per_mtok": 1.5}, "*": {...}}``; the
+        optional ``*`` entry prices models that are not listed."""
+        prices = {name: ModelPrice.model_validate(value) for name, value in raw.items()}
+        default = prices.pop("*", None)
+        return cls(prices, default)
+
+    def merged(self, other: PriceTable) -> PriceTable:
+        """This table with ``other``'s entries (and default, if set) taking precedence."""
+        return PriceTable({**self._prices, **other._prices}, other._default or self._default)
+
     def price_for(self, model: str) -> ModelPrice | None:
         return self._prices.get(model, self._default)
 
@@ -62,8 +74,38 @@ class PriceTable:
         )
 
 
-# Illustrative prices for the fake model so that cost accounting is visible in demos and tests.
+def usage_by_model(trajectory: Trajectory) -> dict[str, Usage]:
+    """Recorded usage of each model the run called, as the provider reported it."""
+    totals: dict[str, Usage] = {}
+    for step in trajectory.llm_steps:
+        model = step.response.model or step.request.model
+        totals[model] = totals.get(model, Usage()) + step.response.usage
+    return dict(sorted(totals.items()))
+
+
+def reprice(trajectory: Trajectory, prices: PriceTable) -> Usage:
+    """The run's token usage priced with ``prices``.
+
+    Recorded costs depend on whichever price table the recording process used, and traces
+    ingested from other frameworks usually carry tokens but no cost. Comparing a candidate with
+    its baseline is only meaningful when both are priced with the same table, so scoring
+    reprices both. Models with no price (and no default) keep their recorded cost.
+    """
+    total = Usage()
+    for step in trajectory.llm_steps:
+        usage = step.response.usage
+        model = step.response.model or step.request.model
+        if prices.price_for(model) is not None:
+            usage = prices.usage(model, usage.input_tokens, usage.output_tokens)
+        total = total + usage
+    return total
+
+
+# Illustrative prices for the fake models so that cost accounting is visible in demos and tests.
 # They are not the price of any real model.
 DEFAULT_PRICES = PriceTable(
-    {"fake-tool-caller-1": ModelPrice(input_per_mtok=0.5, output_per_mtok=1.5)}
+    {
+        "fake-tool-caller-1": ModelPrice(input_per_mtok=0.5, output_per_mtok=1.5),
+        "fake-judge-1": ModelPrice(input_per_mtok=1.0, output_per_mtok=4.0),
+    }
 )

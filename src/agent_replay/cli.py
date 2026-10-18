@@ -5,6 +5,7 @@
     agent-replay replay run.json --match fuzzy --threshold 0.9 --live-reads
     agent-replay replay run.json --policy amount-drift --diff-out diff.md
     agent-replay diff baseline.json candidate.json --format md
+    agent-replay score candidate.json --baseline baseline.json --format md
     agent-replay demo --out-dir runs/
     agent-replay record --task "..." --out run.json --otlp-out spans.json
     agent-replay ingest spans.json            # into AGENT_REPLAY_DATABASE_URL, or memory
@@ -12,7 +13,8 @@
     agent-replay stats
 
 ``replay`` and ``diff`` exit 0 when the runs are behaviourally identical and 1 when they
-diverged, so they can be used directly in CI.
+diverged; ``score`` exits 0 on pass, 1 on fail and 3 when the judge could not decide. All of
+them can be used directly in CI.
 """
 
 from __future__ import annotations
@@ -41,8 +43,9 @@ from agent_replay.normalize import Normalizer
 from agent_replay.recorder import record_run
 from agent_replay.reference import support_desk
 from agent_replay.replay import ReplayMode, ReplayResult, replay
-from agent_replay.report import render_markdown
+from agent_replay.report import render_markdown, render_scorecard
 from agent_replay.sandbox import SandboxPolicy, UnrecordedWrites
+from agent_replay.scoring import ScoringSpec, Verdict, score
 from agent_replay.store import open_store
 
 POLICIES = support_desk.POLICIES
@@ -55,6 +58,7 @@ NORMALIZERS: dict[str, Normalizer] = {
 EXIT_OK = 0
 EXIT_DIVERGED = 1
 EXIT_USAGE = 2
+EXIT_INCONCLUSIVE = 3
 
 
 def _summary(trajectory: Trajectory) -> dict[str, object]:
@@ -155,6 +159,25 @@ async def _diff(args: argparse.Namespace) -> int:
     else:
         print(text)
     return EXIT_OK if diff.identical else EXIT_DIVERGED
+
+
+def _load_spec(path: str | None) -> ScoringSpec:
+    return support_desk.scoring_spec() if path is None else ScoringSpec.from_toml(path)
+
+
+async def _score(args: argparse.Namespace) -> int:
+    candidate = Trajectory.from_json(Path(args.trajectory).read_bytes())
+    baseline = Trajectory.from_json(Path(args.baseline).read_bytes()) if args.baseline else None
+    spec = _load_spec(args.spec)
+    if args.no_judge:
+        spec = spec.model_copy(update={"judge": spec.judge.model_copy(update={"enabled": False})})
+    card = await score(candidate, spec, baseline=baseline, judge=support_desk.build_judge())
+    text = render_scorecard(card) if args.format == "md" else json.dumps(card.to_report(), indent=2)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+    else:
+        print(text)
+    return {Verdict.PASS: EXIT_OK, Verdict.FAIL: EXIT_DIVERGED}.get(card.verdict, EXIT_INCONCLUSIVE)
 
 
 async def _demo(args: argparse.Namespace) -> int:
@@ -289,6 +312,14 @@ def build_parser() -> argparse.ArgumentParser:
     dif.add_argument("--normalizer", choices=sorted(NORMALIZERS), default="support-desk")
     dif.add_argument("--out", help="write the diff here instead of standard output")
 
+    sco = sub.add_parser("score", help="score a run: checks, invariants, then the judge")
+    sco.add_argument("trajectory")
+    sco.add_argument("--baseline", help="baseline run, for cost-regression checks")
+    sco.add_argument("--spec", help="scoring spec TOML (default: the support-desk spec)")
+    sco.add_argument("--no-judge", action="store_true", help="skip the judge layer")
+    sco.add_argument("--format", choices=["md", "json"], default="md")
+    sco.add_argument("--out", help="write the scorecard here instead of standard output")
+
     demo = sub.add_parser("demo", help="record and replay every sample task")
     demo.add_argument("--out-dir", default=".agent-replay/demo")
 
@@ -316,6 +347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "record": _record,
         "replay": _replay,
         "diff": _diff,
+        "score": _score,
         "demo": _demo,
         "ingest": _ingest,
         "stats": _stats,

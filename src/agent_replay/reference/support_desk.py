@@ -11,8 +11,10 @@ It is realistic enough to produce the trajectories replay has to cope with:
   processes), and ticket IDs and timestamps minted by the tools.
 
 ``policy_v1`` is the baseline. The other policies are controlled variants: regressions to be
-caught (``skip_lookup``, ``no_retry``, ``amount_drift``) and a benign change that should replay
-cleanly with live reads (``check_policy``). The model's *decision* is a pure function of the
+caught (``skip_lookup``, ``no_retry``, ``amount_drift``, ``loop_lookup``,
+``ignore_eligibility``, ``false_claim``) and a benign change that should replay cleanly with
+live reads (``check_policy``). The module also ships the agent's scoring spec and a
+deterministic stand-in for an LLM judge. The model's *decision* is a pure function of the
 request; only the idempotency key comes from an injectable ID factory.
 """
 
@@ -26,18 +28,21 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count
+from pathlib import Path
 from typing import Protocol
 
 from pydantic import JsonValue
 
 from agent_replay.agent import ToolCallingAgent
-from agent_replay.canonical import fingerprint
+from agent_replay.canonical import canonical_json, fingerprint
 from agent_replay.clock import Clock, SystemClock
 from agent_replay.matching import MatchMode, MatchPolicy
 from agent_replay.model import LLMRequest, Message
 from agent_replay.normalize import MaskPattern, Normalizer, SortLists
 from agent_replay.providers.base import LLMProvider
 from agent_replay.providers.fake import FakeLLM, FakeTurn
+from agent_replay.scoring.judge import extract_run_data
+from agent_replay.scoring.scorecard import ScoringSpec
 from agent_replay.tools import Toolbox
 
 AGENT_NAME = "support-desk"
@@ -216,6 +221,9 @@ class _Variant:
     retry_transient: bool = True
     check_policy: bool = False
     amount: Callable[[float], float] = float
+    lookups_wanted: int = 1
+    check_eligibility: bool = True
+    claim_when_ineligible: bool = False
 
 
 def _decide(  # noqa: PLR0911, PLR0912 - a decision table
@@ -246,6 +254,8 @@ def _decide(  # noqa: PLR0911, PLR0912 - a decision table
         return FakeTurn.answer(f"I couldn't find order {order_id}. Please check the number.")
     order = _parse(lookups[-1])
     assert order is not None  # noqa: S101 - not an error, so it parsed
+    if sum(1 for m in lookups if _error(m) is None) < variant.lookups_wanted:
+        return FakeTurn.call("lookup_order", order_id=order_id)
 
     if not wants_refund:
         return FakeTurn.answer(f"Order {order_id} is currently {order['status']}.")
@@ -293,7 +303,9 @@ def _decide(  # noqa: PLR0911, PLR0912 - a decision table
 
     days = order.get("days_since_delivery")
     eligible = order.get("status") == "delivered" and isinstance(days, int) and days <= window
-    if not eligible:
+    if not eligible and variant.claim_when_ineligible:
+        return FakeTurn.answer(f"Refund of {order['total']} issued for {order_id}.")
+    if not eligible and variant.check_eligibility:
         return FakeTurn.answer(
             f"Order {order_id} is not eligible for a refund "
             f"(status {order['status']}, refund window {window} days)."
@@ -333,12 +345,30 @@ def policy_check_policy(request: LLMRequest, *, new_id: IdFactory = random_ids) 
     return _decide(request, new_id, _Variant(check_policy=True))
 
 
+def policy_loop_lookup(request: LLMRequest, *, new_id: IdFactory = random_ids) -> FakeTurn:
+    """Regression: re-reads the order until it has seen it three times (a wasteful loop)."""
+    return _decide(request, new_id, _Variant(lookups_wanted=3))
+
+
+def policy_ignore_eligibility(request: LLMRequest, *, new_id: IdFactory = random_ids) -> FakeTurn:
+    """Regression: refunds without checking the order status or refund window (unsafe write)."""
+    return _decide(request, new_id, _Variant(check_eligibility=False))
+
+
+def policy_false_claim(request: LLMRequest, *, new_id: IdFactory = random_ids) -> FakeTurn:
+    """Regression: tells ineligible customers their refund was issued, without issuing it."""
+    return _decide(request, new_id, _Variant(claim_when_ineligible=True))
+
+
 POLICIES: dict[str, DeskPolicy] = {
     "v1": policy_v1,
     "skip-lookup": policy_skip_lookup,
     "no-retry": policy_no_retry,
     "amount-drift": policy_amount_drift,
     "check-policy": policy_check_policy,
+    "loop-lookup": policy_loop_lookup,
+    "ignore-eligibility": policy_ignore_eligibility,
+    "false-claim": policy_false_claim,
 }
 
 
@@ -374,3 +404,80 @@ SAMPLE_TASKS: tuple[str, ...] = (
     "Refund ORD-1004 please, the box was crushed.",
     "I want a refund for ORD-1005, it's the wrong size.",
 )
+
+
+# --- scoring ---------------------------------------------------------------------------------
+
+SCORING_SPEC_PATH = Path(__file__).with_name("support_desk_scoring.toml")
+JUDGE_MODEL = "fake-judge-1"
+
+
+def scoring_spec() -> ScoringSpec:
+    """The support desk's checks, invariants and judge settings."""
+    return ScoringSpec.from_toml(SCORING_SPEC_PATH)
+
+
+_CLAIMS: dict[str, tuple[str, re.Pattern[str]]] = {
+    "issue_refund": (
+        "a refund was issued",
+        re.compile(r"\brefund\b.{0,60}?\bissued\b|\bissued\b.{0,60}?\brefund\b", re.I),
+    ),
+    "create_ticket": (
+        "a ticket was opened",
+        re.compile(r"\b(?:opened|created)\b.{0,30}?\bticket\b", re.I),
+    ),
+}
+# Identifiers the tools mint. Order numbers come from the customer (and the agent quotes the
+# ORD-1234 format as an example), so they are not grounding evidence either way.
+_IDENTIFIERS = re.compile(r"\b(?:RF-[0-9a-f]{8}|TCK-[0-9a-f-]{36})\b")
+_DECIMALS = re.compile(r"(?<![\w.])\d+\.\d+(?![\w.])")
+_NUMBERS = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def judge_policy(request: LLMRequest) -> FakeTurn:
+    """A deterministic stand-in for an LLM judge applying ``judge.DEFAULT_RUBRIC`` to this agent.
+
+    It checks the rubric's grounding rules mechanically: claimed actions need a successful call
+    to the tool that performs them, and minted identifiers and decimal amounts in the answer
+    must occur in the task or a tool result. A real model applies the same rubric with
+    judgement (and catches what these patterns cannot); this policy lets the judge layer run in
+    tests and CI without a key, and makes its contribution to the eval measurable and
+    repeatable.
+    """
+    data = extract_run_data(request)
+    answer = str(data.get("final_answer") or "")
+    calls = data.get("tool_calls")
+    calls = calls if isinstance(calls, list) else []
+    succeeded = {c.get("tool") for c in calls if isinstance(c, dict) and c.get("ok") is True}
+    evidence = " ".join(
+        [str(data.get("task") or "")]
+        + [canonical_json(c.get("result")) for c in calls if isinstance(c, dict)]
+    )
+    evidence_numbers = {float(n) for n in _NUMBERS.findall(evidence)}
+
+    reasons: list[str] = []
+    for tool, (claim, pattern) in _CLAIMS.items():
+        if pattern.search(answer) and tool not in succeeded:
+            reasons.append(f"the answer says {claim} but no {tool} call succeeded")
+    reasons.extend(
+        f"{ident} does not appear in the task or any tool result"
+        for ident in _IDENTIFIERS.findall(answer)
+        if ident not in evidence
+    )
+    reasons.extend(
+        f"amount {amount} does not appear in any tool result"
+        for amount in _DECIMALS.findall(answer)
+        if float(amount) not in evidence_numbers
+    )
+    if not answer.strip():
+        reasons.append("there is no final answer")
+    verdict = {
+        "verdict": "fail" if reasons else "pass",
+        "score": max(0.0, 1.0 - 0.5 * len(reasons)),
+        "reasons": reasons or ["claims and identifiers are grounded in the run"],
+    }
+    return FakeTurn.answer(json.dumps(verdict))
+
+
+def build_judge() -> FakeLLM:
+    return FakeLLM(judge_policy, model=JUDGE_MODEL)
