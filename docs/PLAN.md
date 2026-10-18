@@ -26,3 +26,9 @@ One milestone per day. Each day ships working, tested code; Day 7 is evaluation,
 - Strict cassette replay and the reference agent moved into Day 1 to have a true end-to-end
   slice (record → replay → divergence) from the first day. Day 3 now focuses on normalisation,
   fuzzy matching and the side-effect sandbox.
+- Day 5 (2026-10-18): the eval harness and the labelled dataset landed with scoring rather than
+  on Day 7, because the layers needed a measurement to be designed against. Day 7 extends the
+  same harness (replay determinism rate, localisation) instead of starting one. The eval showed
+  the diff and the scorecard answer different questions (the diff flags benign changes, scoring
+  misses regressions no rule describes), so Day 6's gate takes both: it fails on a scorecard
+  failure, and reports divergences with no failing finding as "changed, needs review".

@@ -186,3 +186,67 @@ them equivalent, rather than tune costs to one reading.
 
 **Next (Day 5)**: layered scoring (deterministic checks → invariants DSL → optional LLM judge),
 per-run token and cost accounting, and the labelled dataset of seeded regressions.
+
+## Day 5 — 2026-10-18: layered scoring and the eval dataset
+
+**Shipped**
+
+- `scoring/invariants.py`: a rule language over the tool calls the model requested, with a
+  tokenizer, a recursive-descent parser (errors carry line and column) and an evaluator.
+  Statements: `require A [where C] before B [on fields]` (the condition may refer to the later
+  call as `target`), `forbid`, `at_most N ... [per fields]`, and `no A after failed B` with
+  recovery by a successful retry of the failed tool. Conditions: comparisons, `and` / `or` /
+  `not`, parentheses; missing paths compare false (fail closed); ordering is numeric only.
+- `scoring/scorecard.py`: `ScoringSpec` (TOML: `[checks]`, `invariants`, `[judge]`,
+  `[prices]`; rules are parsed at load time) and `score()`. Checks: status, answer, model-call
+  and tool-call budgets, absolute cost, cost ratio against the baseline, side-effecting calls
+  the sandbox blocked (error, warning or off). The judge runs only when checks and invariants
+  passed unless `when = "always"`. Verdict pass / fail / inconclusive, an OTel span and a JSON
+  log line per scorecard.
+- `scoring/judge.py`: the judge request (rubric as system prompt, run data as escaped JSON in
+  `<run-data>` tags, results truncated), strict verdict parsing, one repair attempt per
+  malformed reply, timeout and provider errors as inconclusive, judge usage accounted
+  separately.
+- `accounting.py`: per-model usage, repricing with one table for candidate and baseline,
+  price tables from mappings (`*` default), a price for the fake judge model.
+- Reference agent: `loop-lookup`, `ignore-eligibility` and `false-claim` regressions; its
+  scoring spec (`reference/support_desk_scoring.toml`, shipped in the wheel); a deterministic
+  judge policy applying the rubric's grounding rules.
+- `evaluation.py` + `evals/regressions.jsonl`: 64 labelled synthetic cases and
+  `agent-replay eval`; `agent-replay score` with Markdown or JSON scorecards
+  (`report.render_scorecard`, escaped like the diff). CI runs a scoring smoke test and the
+  eval, and publishes both to the job summary.
+- Fixed before it shipped: `ScoringSpec` first cached its parsed rules, and pydantic's
+  `model_copy(update=...)` copied the cache, so a copy with new rules evaluated the old ones. A
+  test caught it; the properties are no longer cached.
+
+**Verified locally** (Python 3.12, PostgreSQL 16, fake providers): ruff and format clean, mypy
+strict clean (74 files), 299 tests passing including the PostgreSQL tests, 98% line coverage.
+
+**Measured** with `agent-replay eval` (64 cases: 18 regression, 5 benign, 41 no-effect; fake
+agent `fake-tool-caller-1`, fake judge `fake-judge-1`; tools-mode replay, live reads, blocked
+writes; bundled spec with `max_cost_ratio = 1.5` set before the first run):
+
+| Detector | TP | FP | FN | TN | Benign flagged | Precision | Recall |
+|----------|----|----|----|----|----------------|-----------|--------|
+| diff | 18 | 5 | 0 | 41 | 5/5 | 0.78 | 1.00 |
+| checks | 14 | 2 | 4 | 44 | 2/5 | 0.88 | 0.78 |
+| invariants | 15 | 0 | 3 | 46 | 0/5 | 1.00 | 0.83 |
+| judge | 2 | 0 | 16 | 46 | 0/5 | 1.00 | 0.11 |
+| layered | 17 | 2 | 1 | 44 | 2/5 | 0.89 | 0.94 |
+
+Per category, the layered verdict caught skipped lookups 6/6, loops 6/6, unsafe writes 2/2,
+argument drift 1/1 and unsupported claims 2/2 (only the judge sees those: the run breaks no
+rule and no budget), and missed the one `missing_retry` case. Its two false positives are
+`check-policy` on the two short runs, where one extra read is more than half the baseline's
+cost. The diff's first divergence named the labelled decision step in 23/23 changed cases. The
+judge was called 47 times in the layered configuration ($0.023266 at the illustrative fake
+prices) against 64 calls ($0.032889) with it always on. Two runs of the eval produce identical
+reports (asserted in the tests).
+
+**Plan adjustment**: the eval harness moved in from Day 7, and the Day 6 gate will combine the
+diff with the scorecard (see PLAN.md).
+
+**Next (Day 6)**: `agent-replay gate` with thresholds and bootstrap confidence intervals over a
+suite, JUnit and Markdown reports, the read API for suites and diffs, span-buffer retention and
+blob sweep, Dockerfile and docker-compose, and optional real providers.
