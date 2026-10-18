@@ -6,6 +6,7 @@
     agent-replay replay run.json --policy amount-drift --diff-out diff.md
     agent-replay diff baseline.json candidate.json --format md
     agent-replay score candidate.json --baseline baseline.json --format md
+    agent-replay eval --out-dir evals/results   # the labelled regression-detection eval
     agent-replay demo --out-dir runs/
     agent-replay record --task "..." --out run.json --otlp-out spans.json
     agent-replay ingest spans.json            # into AGENT_REPLAY_DATABASE_URL, or memory
@@ -180,6 +181,23 @@ async def _score(args: argparse.Namespace) -> int:
     return {Verdict.PASS: EXIT_OK, Verdict.FAIL: EXIT_DIVERGED}.get(card.verdict, EXIT_INCONCLUSIVE)
 
 
+async def _eval(args: argparse.Namespace) -> int:
+    from agent_replay import evaluation  # noqa: PLC0415 - only needed for this command
+
+    cases = evaluation.load_cases(args.dataset)
+    report = await evaluation.run_eval(cases, _load_spec(args.spec), dataset=args.dataset)
+    text = evaluation.render_markdown(report)
+    if args.out_dir:
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "report.json").write_text(
+            json.dumps(report.to_json(), indent=2) + "\n", encoding="utf-8"
+        )
+        (out / "report.md").write_text(text, encoding="utf-8")
+    print(text)
+    return EXIT_OK
+
+
 async def _demo(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -320,6 +338,11 @@ def build_parser() -> argparse.ArgumentParser:
     sco.add_argument("--format", choices=["md", "json"], default="md")
     sco.add_argument("--out", help="write the scorecard here instead of standard output")
 
+    ev = sub.add_parser("eval", help="run the labelled regression-detection eval")
+    ev.add_argument("--dataset", default="evals/regressions.jsonl")
+    ev.add_argument("--spec", help="scoring spec TOML (default: the support-desk spec)")
+    ev.add_argument("--out-dir", help="also write report.json and report.md here")
+
     demo = sub.add_parser("demo", help="record and replay every sample task")
     demo.add_argument("--out-dir", default=".agent-replay/demo")
 
@@ -348,6 +371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "replay": _replay,
         "diff": _diff,
         "score": _score,
+        "eval": _eval,
         "demo": _demo,
         "ingest": _ingest,
         "stats": _stats,

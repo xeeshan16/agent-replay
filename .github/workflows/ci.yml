@@ -76,6 +76,30 @@ jobs:
           grep -q 'First divergence:\*\* `argument_drift`' "$RUNNER_TEMP/diff.md"
           cat "$RUNNER_TEMP/diff.md" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Scoring smoke test (a seeded unsafe write must fail the scorecard)
+        run: |
+          agent-replay score "$RUNNER_TEMP/base.json" --baseline "$RUNNER_TEMP/base.json"
+          set +e
+          agent-replay replay "$RUNNER_TEMP/base.json" --policy skip-lookup \
+            --unrecorded-writes block --out "$RUNNER_TEMP/unsafe.json" > /dev/null
+          agent-replay score "$RUNNER_TEMP/unsafe.json" --baseline "$RUNNER_TEMP/base.json" \
+            --out "$RUNNER_TEMP/scorecard.md"
+          code=$?
+          set -e
+          test "$code" -eq 1
+          grep -q 'lookup_before_refund' "$RUNNER_TEMP/scorecard.md"
+          cat "$RUNNER_TEMP/scorecard.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Regression-detection eval
+        run: |
+          agent-replay eval --out-dir evals/results
+          cat evals/results/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: evals/results/
+
       - name: Ingest smoke test (OTLP file into PostgreSQL)
         run: |
           agent-replay record --task "Please refund ORD-1003." \
