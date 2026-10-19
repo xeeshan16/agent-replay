@@ -8,7 +8,10 @@ batch can hold spans from many traces. The pipeline is shaped around that:
 2. Traces without any GenAI span are ignored, so pointing a general-purpose collector at the
    receiver does not fill the buffer with HTTP and database spans. Spans of a trace that is
    already known are kept even if they are not GenAI spans (they may be intermediate parents).
-3. Every trace that received a new span and has an ``invoke_agent`` span is re-assembled from
+3. Spans of a trace that retention already closed are dropped and counted as expired: the
+   trajectory was assembled from the complete buffer, and re-assembling it from a straggler
+   alone would replace it with a fragment.
+4. Every trace that received a new span and has an ``invoke_agent`` span is re-assembled from
    *all* its buffered spans and saved. Saving identical content is a no-op, and a late child
    span produces a new revision of the same trajectory.
 """
@@ -36,6 +39,7 @@ class IngestReport(BaseModel):
     spans_duplicate: int
     spans_ignored: int
     spans_rejected: int
+    spans_expired: int = 0
     created: list[str]
     updated: list[str]
     unchanged: list[str]
@@ -76,6 +80,7 @@ async def ingest_batch(store: TrajectoryStore, batch: DecodedBatch) -> IngestRep
             spans_duplicate=added.duplicates,
             spans_ignored=ignored,
             spans_rejected=batch.rejected,
+            spans_expired=added.expired,
             created=created,
             updated=updated,
             unchanged=unchanged,
@@ -94,6 +99,7 @@ async def ingest_batch(store: TrajectoryStore, batch: DecodedBatch) -> IngestRep
                     "spans_duplicate": report.spans_duplicate,
                     "spans_ignored": report.spans_ignored,
                     "spans_rejected": report.spans_rejected,
+                    "spans_expired": report.spans_expired,
                     "created": len(created),
                     "updated": len(updated),
                     "pending_traces": pending,

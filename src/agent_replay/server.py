@@ -10,6 +10,10 @@ response contract so standard exporters behave correctly:
 * 503 with ``Retry-After`` when the store is unavailable (exporters retry; ingest is idempotent,
   so a retried batch cannot duplicate data);
 * 401, 413 and 415 for auth, size and content-type problems.
+
+The read API (``/v1/trajectories``, ``/v1/suites``, ``/v1/diff``) serves stored data, which may
+include prompts and tool outputs. Set ``AGENT_REPLAY_READ_TOKEN`` to require a bearer token for
+it; the ingest token is separate so a span exporter's credential cannot read anything back.
 """
 
 from __future__ import annotations
@@ -17,15 +21,17 @@ from __future__ import annotations
 import hmac
 import os
 import zlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import JsonValue
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 
 from agent_replay import __version__
+from agent_replay.diff import diff_trajectories
 from agent_replay.ingest.service import IngestReport, ingest_batch
 from agent_replay.ingest.spans import (
     DecodedBatch,
@@ -36,9 +42,13 @@ from agent_replay.ingest.spans import (
 )
 from agent_replay.logs import get_logger
 from agent_replay.model import Trajectory
-from agent_replay.store import TrajectoryStore, TrajectorySummary, open_store
+from agent_replay.normalize import Normalizer
+from agent_replay.report import render_markdown
+from agent_replay.store import SuiteSummary, TrajectoryStore, TrajectorySummary, open_store
+from agent_replay.suite import SuiteManifest
 
 INGEST_TOKEN_ENV = "AGENT_REPLAY_INGEST_TOKEN"  # noqa: S105 - the variable name, not a secret
+READ_TOKEN_ENV = "AGENT_REPLAY_READ_TOKEN"  # noqa: S105 - the variable name, not a secret
 MAX_BODY_BYTES = 8 * 1024 * 1024
 RETRY_AFTER_S = 5
 
@@ -121,9 +131,32 @@ def _get_store(request: Request) -> TrajectoryStore:
 StoreDep = Annotated[TrajectoryStore, Depends(_get_store)]
 
 
-def create_app(store: TrajectoryStore | None = None, *, ingest_token: str | None = None) -> FastAPI:
-    """Build the app. Without ``store`` it opens one from the environment on startup."""
+def _bearer_check(token: str | None) -> Callable[[str | None], None]:
+    def check(authorization: Annotated[str | None, Header()] = None) -> None:
+        if not token:
+            return
+        supplied = (authorization or "").removeprefix("Bearer ").strip()
+        if not hmac.compare_digest(supplied.encode(), token.encode()):
+            raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+    return check
+
+
+def create_app(
+    store: TrajectoryStore | None = None,
+    *,
+    ingest_token: str | None = None,
+    read_token: str | None = None,
+    normalizer: Normalizer | None = None,
+) -> FastAPI:
+    """Build the app. Without ``store`` it opens one from the environment on startup.
+
+    ``normalizer`` masks volatile values before ``/v1/diff`` aligns two runs (default: the
+    built-in timestamp, UUID and call-ID masks).
+    """
     token = ingest_token if ingest_token is not None else os.environ.get(INGEST_TOKEN_ENV)
+    reader = read_token if read_token is not None else os.environ.get(READ_TOKEN_ENV)
+    diff_normalizer = normalizer or Normalizer.default()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -137,12 +170,8 @@ def create_app(store: TrajectoryStore | None = None, *, ingest_token: str | None
 
     app = FastAPI(title="agent-replay", version=__version__, lifespan=lifespan)
 
-    def check_token(authorization: Annotated[str | None, Header()] = None) -> None:
-        if not token:
-            return
-        supplied = (authorization or "").removeprefix("Bearer ").strip()
-        if not hmac.compare_digest(supplied.encode(), token.encode()):
-            raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+    check_token = _bearer_check(token)
+    read = [Depends(_bearer_check(reader))]
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -181,7 +210,14 @@ def create_app(store: TrajectoryStore | None = None, *, ingest_token: str | None
         headers = {"X-Agent-Replay-Ingest": _report_header(report)}
         return Response(content=payload, media_type=media_type, headers=headers)
 
-    @app.get("/v1/trajectories")
+    app.include_router(_read_router(diff_normalizer), dependencies=read)
+    return app
+
+
+def _read_router(diff_normalizer: Normalizer) -> APIRouter:
+    router = APIRouter()
+
+    @router.get("/v1/trajectories")
     async def list_trajectories(
         store: StoreDep,
         agent: str | None = None,
@@ -189,19 +225,52 @@ def create_app(store: TrajectoryStore | None = None, *, ingest_token: str | None
     ) -> list[TrajectorySummary]:
         return await store.list_trajectories(agent_name=agent, limit=limit)
 
-    @app.get("/v1/trajectories/{trajectory_id}")
+    # ``:path`` because trajectory IDs may contain slashes (suite cases are ``suite/case``).
+    @router.get("/v1/trajectories/{trajectory_id:path}")
     async def get_trajectory(trajectory_id: str, store: StoreDep) -> Trajectory:
-        trajectory = await store.get(trajectory_id)
-        if trajectory is None:
-            raise HTTPException(status_code=404, detail="trajectory not found")
-        return trajectory
+        return await _require(store, trajectory_id)
 
-    return app
+    @router.get("/v1/suites")
+    async def list_suites(store: StoreDep) -> list[SuiteSummary]:
+        return await store.list_suites()
+
+    @router.get("/v1/suites/{name}")
+    async def get_suite(name: str, store: StoreDep) -> SuiteManifest:
+        manifest = await store.get_suite(name)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="suite not found")
+        return manifest
+
+    @router.get("/v1/diff", response_model=None)
+    async def diff(
+        store: StoreDep,
+        baseline: str,
+        candidate: str,
+        format: Annotated[str, Query(pattern="^(json|md)$")] = "json",
+    ) -> dict[str, JsonValue] | PlainTextResponse:
+        """Align two stored trajectories and explain the first divergence."""
+        result = diff_trajectories(
+            await _require(store, baseline),
+            await _require(store, candidate),
+            normalizer=diff_normalizer,
+        )
+        if format == "md":
+            return PlainTextResponse(render_markdown(result), media_type="text/markdown")
+        return result.to_report()
+
+    return router
+
+
+async def _require(store: TrajectoryStore, trajectory_id: str) -> Trajectory:
+    trajectory = await store.get(trajectory_id)
+    if trajectory is None:
+        raise HTTPException(status_code=404, detail=f"trajectory {trajectory_id!r} not found")
+    return trajectory
 
 
 def _report_header(report: IngestReport) -> str:
     return (
         f"inserted={report.spans_inserted};duplicate={report.spans_duplicate};"
-        f"ignored={report.spans_ignored};created={len(report.created)};"
+        f"ignored={report.spans_ignored};expired={report.spans_expired};created={len(report.created)};"
         f"updated={len(report.updated)};pending={report.pending_traces}"
     )

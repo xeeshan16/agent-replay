@@ -6,9 +6,12 @@ import os
 
 from agent_replay.store.base import (
     AddSpansResult,
+    PruneResult,
     SaveOutcome,
     SaveResult,
     StoreStats,
+    SuiteSummary,
+    SweepResult,
     TrajectoryStore,
     TrajectorySummary,
 )
@@ -20,9 +23,12 @@ __all__ = [
     "DATABASE_URL_ENV",
     "AddSpansResult",
     "InMemoryStore",
+    "PruneResult",
     "SaveOutcome",
     "SaveResult",
     "StoreStats",
+    "SuiteSummary",
+    "SweepResult",
     "TrajectoryStore",
     "TrajectorySummary",
     "open_store",

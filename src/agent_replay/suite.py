@@ -18,6 +18,7 @@ import re
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
@@ -112,6 +113,46 @@ def verify(manifest: SuiteManifest, baselines: dict[str, Trajectory]) -> Suite:
     if extra:
         raise SuiteError(f"suite {manifest.name}: baselines for unknown cases {sorted(extra)}")
     return Suite(manifest=manifest, baselines=baselines)
+
+
+def check_stored(manifest: SuiteManifest, fingerprints: dict[str, str]) -> SuiteManifest:
+    """Validate a manifest against the fingerprints of stored trajectories (by trajectory ID)
+    and return it as stored: without file paths, which mean nothing inside a database."""
+    for case in manifest.cases:
+        stored = fingerprints.get(case.trajectory_id)
+        if stored is None:
+            raise SuiteError(
+                f"suite {manifest.name}: trajectory {case.trajectory_id} is not stored"
+            )
+        if stored != case.fingerprint:
+            raise SuiteError(
+                f"suite {manifest.name}: stored trajectory {case.trajectory_id} does not match "
+                "the fingerprint in the manifest"
+            )
+    return manifest.model_copy(
+        update={"cases": tuple(c.model_copy(update={"file": None}) for c in manifest.cases)}
+    )
+
+
+class SuiteSource(Protocol):
+    """The part of a trajectory store a stored suite is loaded from."""
+
+    async def get_suite(self, name: str) -> SuiteManifest | None: ...
+
+    async def get(self, trajectory_id: str) -> Trajectory | None: ...
+
+
+async def load_stored_suite(source: SuiteSource, name: str) -> Suite:
+    manifest = await source.get_suite(name)
+    if manifest is None:
+        raise SuiteError(f"no stored suite named {name!r}")
+    baselines: dict[str, Trajectory] = {}
+    for case in manifest.cases:
+        trajectory = await source.get(case.trajectory_id)
+        if trajectory is None:
+            raise SuiteError(f"suite {name}: trajectory {case.trajectory_id} is not stored")
+        baselines[case.id] = trajectory
+    return verify(manifest, baselines)
 
 
 def load_suite(directory: str | Path) -> Suite:

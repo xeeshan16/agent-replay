@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
 
@@ -61,3 +62,18 @@ async def store(request: pytest.FixtureRequest) -> AsyncIterator[TrajectoryStore
         yield pg
     finally:
         await pg.close()
+
+
+@pytest.fixture
+def pg_url() -> str:
+    """A PostgreSQL URL for CLI tests, with the database emptied first."""
+    url = _postgres_url()
+
+    async def reset() -> None:
+        pg = PostgresStore.from_url(url)
+        await pg.migrate()
+        await pg.truncate()
+        await pg.close()
+
+    asyncio.run(reset())
+    return url

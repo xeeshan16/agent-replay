@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 
 from agent_replay.ingest.spans import SpanRecord
 from agent_replay.model import Trajectory
+from agent_replay.suite import SuiteManifest
 
 TraceBuilder = Callable[[Sequence[SpanRecord]], list[Trajectory]]
 
@@ -34,6 +35,32 @@ class AddSpansResult:
     inserted: int
     duplicates: int
     traces: frozenset[str]  # traces that received at least one new span
+    expired: int = 0  # spans of traces already closed by retention (dropped)
+
+
+@dataclass(frozen=True, slots=True)
+class PruneResult:
+    traces: int  # traces closed (tombstoned) by this run
+    spans: int  # buffered spans deleted
+
+
+@dataclass(frozen=True, slots=True)
+class SweepResult:
+    scanned: int  # blobs old enough to be considered
+    deleted: int
+    deleted_bytes: int
+    live: int  # blobs reachable from a stored trajectory
+
+
+class SuiteSummary(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    description: str
+    agent_name: str
+    case_count: int
+    revision: int
+    created_at: datetime
 
 
 class TrajectorySummary(BaseModel):
@@ -90,6 +117,23 @@ class TrajectoryStore(Protocol):
         Implementations serialise rebuilds of the same trace so concurrent batches cannot
         overwrite a newer assembly with an older one.
         """
+
+    async def prune_spans(self, received_before: datetime) -> PruneResult:
+        """Close every trace whose newest buffered span arrived before ``received_before``:
+        delete its spans and leave a tombstone, so a straggler span cannot re-assemble the
+        trace from a partial buffer and overwrite the complete trajectory."""
+
+    async def sweep_blobs(self, created_before: datetime) -> SweepResult:
+        """Delete blobs no stored trajectory references (directly or from inside another
+        blob) that were created before ``created_before``. Safe to run during ingest."""
+
+    async def save_suite(self, manifest: SuiteManifest) -> SaveResult:
+        """Insert or update a suite by name. Every case's trajectory must already be stored
+        with the fingerprint the manifest pins."""
+
+    async def get_suite(self, name: str) -> SuiteManifest | None: ...
+
+    async def list_suites(self) -> list[SuiteSummary]: ...
 
     async def stats(self) -> StoreStats: ...
 

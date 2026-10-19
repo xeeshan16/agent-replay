@@ -9,6 +9,9 @@
     agent-replay eval --out-dir evals/results   # the labelled regression-detection eval
     agent-replay suite record --out-dir suites/support-desk-v1
     agent-replay gate --baseline suites/support-desk-v1 --policy v2 --junit gate.xml
+    agent-replay suite push suites/support-desk-v1   # into the store, readable over the API
+    agent-replay gate --suite support-desk-v1 --policy v2
+    agent-replay maintain --span-retention-hours 72 --blob-grace-hours 1
     agent-replay demo --out-dir runs/
     agent-replay record --task "..." --out run.json --otlp-out spans.json
     agent-replay ingest spans.json            # into AGENT_REPLAY_DATABASE_URL, or memory
@@ -28,6 +31,8 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from opentelemetry.sdk.trace import TracerProvider
@@ -54,7 +59,7 @@ from agent_replay.report import render_markdown, render_scorecard
 from agent_replay.sandbox import SandboxPolicy, UnrecordedWrites
 from agent_replay.scoring import ScoringSpec, Verdict, score
 from agent_replay.store import open_store
-from agent_replay.suite import load_suite, record_suite, write_suite
+from agent_replay.suite import Suite, load_stored_suite, load_suite, record_suite, write_suite
 
 POLICIES = support_desk.POLICIES
 NORMALIZERS: dict[str, Normalizer] = {
@@ -62,6 +67,8 @@ NORMALIZERS: dict[str, Normalizer] = {
     "default": Normalizer.default(),
     "support-desk": support_desk.NORMALIZER,
 }
+
+DB_HELP = "PostgreSQL URL (default: $AGENT_REPLAY_DATABASE_URL, else in-memory)"
 
 EXIT_OK = 0
 EXIT_DIVERGED = 1
@@ -252,8 +259,52 @@ def _thresholds(args: argparse.Namespace) -> GateThresholds:
     return GateThresholds.model_validate({**thresholds.model_dump(), **overrides})
 
 
+async def _suite_push(args: argparse.Namespace) -> int:
+    suite = load_suite(args.directory)
+    store = await open_store(args.database_url)
+    try:
+        saved = [await store.save(t) for _, t in suite.items()]
+        result = await store.save_suite(suite.manifest)
+    finally:
+        await store.close()
+    print(
+        json.dumps(
+            {
+                "suite": result.trajectory_id,
+                "outcome": result.outcome.value,
+                "revision": result.revision,
+                "trajectories": {s.trajectory_id: s.outcome.value for s in saved},
+            },
+            indent=2,
+        )
+    )
+    return EXIT_OK
+
+
+async def _maintain(args: argparse.Namespace) -> int:
+    now = datetime.now(UTC)
+    store = await open_store(args.database_url)
+    try:
+        pruned = await store.prune_spans(now - timedelta(hours=args.span_retention_hours))
+        swept = await store.sweep_blobs(now - timedelta(hours=args.blob_grace_hours))
+    finally:
+        await store.close()
+    print(json.dumps({"span_buffer": asdict(pruned), "blobs": asdict(swept)}, indent=2))
+    return EXIT_OK
+
+
+async def _load_gate_suite(args: argparse.Namespace) -> Suite:
+    if args.baseline:
+        return load_suite(args.baseline)
+    store = await open_store(args.database_url)
+    try:
+        return await load_stored_suite(store, args.suite)
+    finally:
+        await store.close()
+
+
 async def _gate(args: argparse.Namespace) -> int:
-    suite = load_suite(args.baseline)
+    suite = await _load_gate_suite(args)
     spec = _load_spec(args.spec)
     judge = None if args.no_judge else support_desk.build_judge()
     policy = POLICIES[args.policy]
@@ -382,11 +433,17 @@ def _add_suite_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) 
     srec.add_argument("--description", default="")
     srec.add_argument("--tasks", help="file with one task per line (default: the sample tasks)")
     srec.add_argument("--policy", choices=sorted(POLICIES), default="v1")
+    spush = suite_sub.add_parser("push", help="store a suite and its baselines")
+    spush.add_argument("directory")
+    spush.add_argument("--database-url", help=DB_HELP)
 
 
 def _add_gate_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     gate = sub.add_parser("gate", help="gate a candidate against a baseline suite")
-    gate.add_argument("--baseline", required=True, help="suite directory (with suite.json)")
+    source = gate.add_mutually_exclusive_group(required=True)
+    source.add_argument("--baseline", help="suite directory (with suite.json)")
+    source.add_argument("--suite", help="name of a suite pushed to the store")
+    gate.add_argument("--database-url", help=DB_HELP)
     gate.add_argument("--policy", choices=sorted(POLICIES), default="v1", help="candidate")
     gate.add_argument("--repeats", type=int, default=1, help="replays per case")
     gate.add_argument("--concurrency", type=int, default=4)
@@ -399,6 +456,36 @@ def _add_gate_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
     gate.add_argument("--markdown", help="write the Markdown report here")
     gate.add_argument("--junit", help="write a JUnit XML report here")
     gate.add_argument("--json", help="write the full JSON report here")
+
+
+def _add_store_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    db_help = DB_HELP
+    ing = sub.add_parser("ingest", help="ingest OTLP trace files into the store")
+    ing.add_argument("files", nargs="+")
+    ing.add_argument("--database-url", help=db_help)
+
+    maint = sub.add_parser("maintain", help="prune the span buffer and sweep orphaned blobs")
+    maint.add_argument(
+        "--span-retention-hours",
+        type=float,
+        default=72.0,
+        help="close traces whose newest span is older than this",
+    )
+    maint.add_argument(
+        "--blob-grace-hours",
+        type=float,
+        default=1.0,
+        help="only sweep unreferenced blobs older than this",
+    )
+    maint.add_argument("--database-url", help=db_help)
+
+    stats = sub.add_parser("stats", help="show store size and blob deduplication")
+    stats.add_argument("--database-url", help=db_help)
+
+    serve = sub.add_parser("serve", help="run the OTLP/HTTP receiver and read API")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=4318)
+    serve.add_argument("--database-url", help=db_help)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -465,18 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
     demo = sub.add_parser("demo", help="record and replay every sample task")
     demo.add_argument("--out-dir", default=".agent-replay/demo")
 
-    db_help = "PostgreSQL URL (default: $AGENT_REPLAY_DATABASE_URL, else in-memory)"
-    ing = sub.add_parser("ingest", help="ingest OTLP trace files into the store")
-    ing.add_argument("files", nargs="+")
-    ing.add_argument("--database-url", help=db_help)
-
-    stats = sub.add_parser("stats", help="show store size and blob deduplication")
-    stats.add_argument("--database-url", help=db_help)
-
-    serve = sub.add_parser("serve", help="run the OTLP/HTTP receiver and read API")
-    serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=4318)
-    serve.add_argument("--database-url", help=db_help)
+    _add_store_parsers(sub)
     return parser
 
 
@@ -486,7 +562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve":
         return _serve(args)
     if args.command == "suite":
-        suite_handlers = {"record": _suite_record}
+        suite_handlers = {"record": _suite_record, "push": _suite_push}
         return asyncio.run(suite_handlers[args.suite_command](args))
     handlers = {
         "record": _record,
@@ -498,6 +574,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "demo": _demo,
         "ingest": _ingest,
         "stats": _stats,
+        "maintain": _maintain,
     }
     return asyncio.run(handlers[args.command](args))
 

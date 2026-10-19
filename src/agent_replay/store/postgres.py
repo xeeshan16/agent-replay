@@ -8,6 +8,16 @@ Schema (see ``tables`` below):
 * ``trajectory_steps``: ordered step rows pointing at their input and output blobs.
 * ``otlp_spans``: the raw span buffer, unique on (trace_id, span_id), which is what makes
   re-delivered OTLP batches harmless.
+* ``pruned_traces``: tombstones for traces whose buffered spans were deleted by retention, so a
+  straggler span is dropped instead of re-assembling a partial trace over a complete one.
+* ``suites``: named baseline suites (a manifest of trajectory IDs and pinned fingerprints).
+
+Blob sweep: blobs are shared and referenced from inside other blobs, so they cannot be deleted
+with a foreign key cascade. ``sweep_blobs`` marks every digest reachable from a stored step and
+deletes the rest under an exclusive advisory lock; every save takes the same lock in shared
+mode. A save therefore either commits before the sweep marks (its blobs are live) or starts
+after the sweep committed (its blobs are re-inserted), and a blob a running save just reused can
+never be swept from under it.
 
 Concurrency: rebuilding a trace takes a transaction-scoped advisory lock on the trace ID, so two
 workers ingesting different batches of the same trace serialise instead of racing, and each save
@@ -16,8 +26,10 @@ locks its trajectory row (``SELECT ... FOR UPDATE``) before comparing content di
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -48,12 +60,16 @@ from agent_replay.model import Trajectory
 from agent_replay.store import codec
 from agent_replay.store.base import (
     AddSpansResult,
+    PruneResult,
     SaveOutcome,
     SaveResult,
     StoreStats,
+    SuiteSummary,
+    SweepResult,
     TraceBuilder,
     TrajectorySummary,
 )
+from agent_replay.suite import SuiteError, SuiteManifest, check_stored
 
 _log = get_logger("store.postgres")
 metadata = MetaData()
@@ -133,6 +149,29 @@ spans = Table(
     PrimaryKeyConstraint("trace_id", "span_id"),
 )
 
+pruned_traces = Table(
+    "pruned_traces",
+    metadata,
+    Column("trace_id", Text, primary_key=True),
+    Column("pruned_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+suites = Table(
+    "suites",
+    metadata,
+    Column("name", Text, primary_key=True),
+    Column("description", Text, nullable=False),
+    Column("agent_name", Text, nullable=False),
+    Column("case_count", Integer, nullable=False),
+    Column("manifest", Text, nullable=False),
+    Column("revision", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+# One advisory lock key guards blob reuse against the sweep (shared: saves, exclusive: sweep).
+_SWEEP_LOCK_KEY = "agent_replay:blob-sweep"
+
 # asyncpg caps a statement at 32767 bind parameters; stay well below for multi-row inserts.
 _CHUNK = 500
 
@@ -187,6 +226,10 @@ class PostgresStore:
 
     async def _save(self, conn: AsyncConnection, encoded: codec.EncodedTrajectory) -> SaveResult:
         header = encoded.header
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:key, 0))"),
+            {"key": _SWEEP_LOCK_KEY},
+        )
         current = await self._lock_row(conn, header.trajectory_id)
         if current is not None and current[0] == header.content_digest:
             return SaveResult(header.trajectory_id, SaveOutcome.UNCHANGED, current[1])
@@ -339,6 +382,10 @@ class PostgresStore:
         # Deduplicate within the batch too: ON CONFLICT cannot handle a key twice in one VALUES.
         unique = list({(s.trace_id, s.span_id): s for s in records}.values())
         async with self._engine.begin() as conn:
+            closed = await self._pruned(conn, {s.trace_id for s in unique})
+            live = [s for s in unique if s.trace_id not in closed]
+            expired = len(unique) - len(live)
+            unique = live
             for chunk in _chunks(unique):
                 result = await conn.execute(
                     pg_insert(spans)
@@ -361,7 +408,148 @@ class PostgresStore:
                 new = [row[0] for row in result]
                 inserted += len(new)
                 traces.update(new)
-        return AddSpansResult(inserted, len(records) - inserted, frozenset(traces))
+        return AddSpansResult(
+            inserted, len(records) - inserted - expired, frozenset(traces), expired=expired
+        )
+
+    @staticmethod
+    async def _pruned(conn: AsyncConnection, trace_ids: set[str]) -> set[str]:
+        if not trace_ids:
+            return set()
+        result = await conn.execute(
+            select(pruned_traces.c.trace_id).where(pruned_traces.c.trace_id.in_(sorted(trace_ids)))
+        )
+        return {row[0] for row in result}
+
+    async def prune_spans(self, received_before: datetime) -> PruneResult:
+        async with self._engine.begin() as conn:
+            old = [
+                row[0]
+                for row in await conn.execute(
+                    select(spans.c.trace_id)
+                    .group_by(spans.c.trace_id)
+                    .having(func.max(spans.c.received_at) < received_before)
+                    .order_by(spans.c.trace_id)
+                )
+            ]
+            deleted = 0
+            for chunk in _chunks(old):
+                ids = list(chunk)
+                await conn.execute(
+                    pg_insert(pruned_traces)
+                    .values([{"trace_id": t} for t in ids])
+                    .on_conflict_do_nothing(index_elements=["trace_id"])
+                )
+                result = await conn.execute(spans.delete().where(spans.c.trace_id.in_(ids)))
+                deleted += result.rowcount or 0
+        _log.info("pruned span buffer", extra={"ctx": {"traces": len(old), "spans": deleted}})
+        return PruneResult(traces=len(old), spans=deleted)
+
+    async def sweep_blobs(self, created_before: datetime) -> SweepResult:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": _SWEEP_LOCK_KEY},
+            )
+            step_level = {
+                row[0]
+                for row in await conn.execute(
+                    text(
+                        "SELECT input_digest FROM trajectory_steps"
+                        " UNION SELECT output_digest FROM trajectory_steps"
+                    )
+                )
+            }
+            # Only LLM-request blobs reference other blobs; scan those in bounded batches.
+            live = set(step_level)
+            for chunk in _chunks(sorted(step_level), 2000):
+                bodies = await self._fetch_blobs(conn, set(chunk))
+                live.update(codec.nested_digests(bodies))
+            candidates = (
+                await conn.execute(
+                    select(blobs.c.digest, blobs.c.size_bytes).where(
+                        blobs.c.created_at < created_before
+                    )
+                )
+            ).all()
+            dead = [(row.digest, row.size_bytes) for row in candidates if row.digest not in live]
+            for chunk in _chunks(dead, 5000):
+                await conn.execute(blobs.delete().where(blobs.c.digest.in_([d for d, _ in chunk])))
+        result = SweepResult(
+            scanned=len(candidates),
+            deleted=len(dead),
+            deleted_bytes=sum(size for _, size in dead),
+            live=len(live),
+        )
+        _log.info("swept blobs", extra={"ctx": dataclasses.asdict(result)})
+        return result
+
+    # --- suites -----------------------------------------------------------------------------
+
+    async def save_suite(self, manifest: SuiteManifest) -> SaveResult:
+        ids = sorted({c.trajectory_id for c in manifest.cases})
+        async with self._engine.begin() as conn:
+            rows = await conn.execute(
+                select(trajectories.c.trajectory_id, trajectories.c.fingerprint).where(
+                    trajectories.c.trajectory_id.in_(ids)
+                )
+            )
+            stored = check_stored(manifest, {r.trajectory_id: r.fingerprint for r in rows})
+            body = stored.model_dump_json()
+            current = (
+                await conn.execute(
+                    select(suites.c.manifest, suites.c.revision)
+                    .where(suites.c.name == stored.name)
+                    .with_for_update()
+                )
+            ).first()
+            values = {
+                "description": stored.description,
+                "agent_name": stored.agent_name,
+                "case_count": len(stored.cases),
+                "manifest": body,
+                "created_at": stored.created_at,
+            }
+            if current is None:
+                inserted = await conn.execute(
+                    pg_insert(suites)
+                    .values(name=stored.name, revision=1, **values)
+                    .on_conflict_do_nothing(index_elements=["name"])
+                    .returning(suites.c.revision)
+                )
+                if inserted.first() is not None:
+                    return SaveResult(stored.name, SaveOutcome.CREATED, 1)
+                raise SuiteError(f"suite {stored.name} was created concurrently; retry")
+            if current.manifest == body:
+                return SaveResult(stored.name, SaveOutcome.UNCHANGED, current.revision)
+            revision = current.revision + 1
+            await conn.execute(
+                update(suites)
+                .where(suites.c.name == stored.name)
+                .values(**values, revision=revision, updated_at=func.now())
+            )
+            return SaveResult(stored.name, SaveOutcome.UPDATED, revision)
+
+    async def get_suite(self, name: str) -> SuiteManifest | None:
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(select(suites.c.manifest).where(suites.c.name == name))
+            ).first()
+        return None if row is None else SuiteManifest.model_validate_json(row[0])
+
+    async def list_suites(self) -> list[SuiteSummary]:
+        async with self._engine.connect() as conn:
+            rows = await conn.execute(
+                select(
+                    suites.c.name,
+                    suites.c.description,
+                    suites.c.agent_name,
+                    suites.c.case_count,
+                    suites.c.revision,
+                    suites.c.created_at,
+                ).order_by(suites.c.name)
+            )
+            return [SuiteSummary.model_validate(dict(r._mapping)) for r in rows]
 
     async def rebuild_trace(self, trace_id: str, build: TraceBuilder) -> list[SaveResult]:
         async with self._engine.begin() as conn:
@@ -369,6 +557,8 @@ class PostgresStore:
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
                 {"key": f"agent_replay:trace:{trace_id}"},
             )
+            if await self._pruned(conn, {trace_id}):
+                return []
             rows = (
                 await conn.execute(
                     select(spans.c.operation, spans.c.record).where(spans.c.trace_id == trace_id)
@@ -401,7 +591,10 @@ class PostgresStore:
         """Delete all data. Intended for tests."""
         async with self._engine.begin() as conn:
             await conn.execute(
-                text("TRUNCATE trajectory_steps, trajectories, blobs, otlp_spans CASCADE")
+                text(
+                    "TRUNCATE trajectory_steps, trajectories, blobs, otlp_spans, pruned_traces,"
+                    " suites CASCADE"
+                )
             )
 
 
