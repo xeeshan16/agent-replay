@@ -90,6 +90,19 @@ jobs:
           grep -q 'lookup_before_refund' "$RUNNER_TEMP/scorecard.md"
           cat "$RUNNER_TEMP/scorecard.md" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Gate (an identical candidate passes; a seeded unsafe regression breaches)
+        run: |
+          agent-replay suite record --out-dir "$RUNNER_TEMP/suite"
+          agent-replay gate --baseline "$RUNNER_TEMP/suite" --junit "$RUNNER_TEMP/gate-pass.xml"
+          set +e
+          agent-replay gate --baseline "$RUNNER_TEMP/suite" --policy skip-lookup \
+            --junit "$RUNNER_TEMP/gate-breach.xml" --markdown "$RUNNER_TEMP/gate.md" > /dev/null
+          code=$?
+          set -e
+          test "$code" -eq 1
+          grep -q '| unsafe_actions | BREACH |' "$RUNNER_TEMP/gate.md"
+          cat "$RUNNER_TEMP/gate.md" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Regression-detection eval
         run: |
           agent-replay eval --out-dir evals/results

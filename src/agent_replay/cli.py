@@ -7,6 +7,8 @@
     agent-replay diff baseline.json candidate.json --format md
     agent-replay score candidate.json --baseline baseline.json --format md
     agent-replay eval --out-dir evals/results   # the labelled regression-detection eval
+    agent-replay suite record --out-dir suites/support-desk-v1
+    agent-replay gate --baseline suites/support-desk-v1 --policy v2 --junit gate.xml
     agent-replay demo --out-dir runs/
     agent-replay record --task "..." --out run.json --otlp-out spans.json
     agent-replay ingest spans.json            # into AGENT_REPLAY_DATABASE_URL, or memory
@@ -14,8 +16,8 @@
     agent-replay stats
 
 ``replay`` and ``diff`` exit 0 when the runs are behaviourally identical and 1 when they
-diverged; ``score`` exits 0 on pass, 1 on fail and 3 when the judge could not decide. All of
-them can be used directly in CI.
+diverged; ``score`` exits 0 on pass, 1 on fail and 3 when the judge could not decide; ``gate``
+exits 0 when every threshold held and 1 on a breach. All of them can be used directly in CI.
 """
 
 from __future__ import annotations
@@ -32,8 +34,12 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from agent_replay.agent import ToolCallingAgent
 from agent_replay.clock import TickingClock
 from agent_replay.diff import TrajectoryDiff, diff_trajectories
+from agent_replay.gate import GateThresholds, ReplaySettings, run_gate
+from agent_replay.gate_report import render_junit
+from agent_replay.gate_report import render_markdown as render_gate_markdown
 from agent_replay.ingest.export import spans_to_otlp_json
 from agent_replay.ingest.service import ingest_batch
 from agent_replay.ingest.spans import decode_json, decode_protobuf
@@ -48,6 +54,7 @@ from agent_replay.report import render_markdown, render_scorecard
 from agent_replay.sandbox import SandboxPolicy, UnrecordedWrites
 from agent_replay.scoring import ScoringSpec, Verdict, score
 from agent_replay.store import open_store
+from agent_replay.suite import load_suite, record_suite, write_suite
 
 POLICIES = support_desk.POLICIES
 NORMALIZERS: dict[str, Normalizer] = {
@@ -198,6 +205,87 @@ async def _eval(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _write(path: str | None, text: str) -> None:
+    if path:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+
+
+async def _suite_record(args: argparse.Namespace) -> int:
+    tasks = (
+        [t for t in Path(args.tasks).read_text(encoding="utf-8").splitlines() if t.strip()]
+        if args.tasks
+        else list(support_desk.SAMPLE_TASKS)
+    )
+    policy = POLICIES[args.policy]
+    suite = await record_suite(
+        args.name,
+        tasks,
+        lambda case_id: support_desk.build_agent(
+            policy=policy, id_factory=support_desk.seeded_ids(f"{args.name}/{case_id}")
+        ),
+        description=args.description,
+        metadata={"policy": args.policy, "model": support_desk.MODEL},
+    )
+    root = write_suite(suite, args.out_dir)
+    print(
+        json.dumps(
+            {
+                "suite": suite.name,
+                "path": str(root),
+                "cases": [c.model_dump(exclude_none=True) for c in suite.manifest.cases],
+            },
+            indent=2,
+        )
+    )
+    return EXIT_OK
+
+
+def _thresholds(args: argparse.Namespace) -> GateThresholds:
+    thresholds = GateThresholds.from_toml(args.config) if args.config else GateThresholds()
+    overrides = {
+        name: getattr(args, name)
+        for name in ("max_success_drop", "min_success_rate", "max_cost_ratio")
+        if getattr(args, name) is not None
+    }
+    return GateThresholds.model_validate({**thresholds.model_dump(), **overrides})
+
+
+async def _gate(args: argparse.Namespace) -> int:
+    suite = load_suite(args.baseline)
+    spec = _load_spec(args.spec)
+    judge = None if args.no_judge else support_desk.build_judge()
+    policy = POLICIES[args.policy]
+
+    def candidate(case_id: str, repeat: int) -> ToolCallingAgent:
+        return support_desk.build_agent(
+            policy=policy, id_factory=support_desk.seeded_ids(f"{case_id}/{repeat}")
+        )
+
+    report = await run_gate(
+        suite,
+        candidate,
+        spec,
+        match=support_desk.match_policy(),
+        thresholds=_thresholds(args),
+        judge=judge,
+        repeats=args.repeats,
+        concurrency=args.concurrency,
+        settings=ReplaySettings(),
+        candidate=f"support-desk policy {args.policy}",
+        provider=f"fake (agent {support_desk.MODEL}"
+        + ("" if judge is None else f", judge {spec.judge.model}")
+        + "); no network",
+    )
+    markdown = render_gate_markdown(report)
+    _write(args.markdown, markdown)
+    _write(args.junit, render_junit(report))
+    _write(args.json, json.dumps(report.to_json(), indent=2) + "\n")
+    print(markdown)
+    return EXIT_OK if report.passed else EXIT_DIVERGED
+
+
 async def _demo(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -285,6 +373,34 @@ def _serve(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _add_suite_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    suite = sub.add_parser("suite", help="manage baseline suites")
+    suite_sub = suite.add_subparsers(dest="suite_command", required=True)
+    srec = suite_sub.add_parser("record", help="record a baseline suite from a task list")
+    srec.add_argument("--out-dir", required=True)
+    srec.add_argument("--name", default="support-desk-v1")
+    srec.add_argument("--description", default="")
+    srec.add_argument("--tasks", help="file with one task per line (default: the sample tasks)")
+    srec.add_argument("--policy", choices=sorted(POLICIES), default="v1")
+
+
+def _add_gate_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    gate = sub.add_parser("gate", help="gate a candidate against a baseline suite")
+    gate.add_argument("--baseline", required=True, help="suite directory (with suite.json)")
+    gate.add_argument("--policy", choices=sorted(POLICIES), default="v1", help="candidate")
+    gate.add_argument("--repeats", type=int, default=1, help="replays per case")
+    gate.add_argument("--concurrency", type=int, default=4)
+    gate.add_argument("--spec", help="scoring spec TOML (default: the support-desk spec)")
+    gate.add_argument("--config", help="TOML file with a [gate] table of thresholds")
+    gate.add_argument("--max-success-drop", type=float)
+    gate.add_argument("--min-success-rate", type=float)
+    gate.add_argument("--max-cost-ratio", type=float)
+    gate.add_argument("--no-judge", action="store_true", help="skip the judge layer")
+    gate.add_argument("--markdown", help="write the Markdown report here")
+    gate.add_argument("--junit", help="write a JUnit XML report here")
+    gate.add_argument("--json", help="write the full JSON report here")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-replay", description=__doc__.split("\n")[0])
     parser.add_argument("--log-level", default=os.environ.get("AGENT_REPLAY_LOG_LEVEL", "WARNING"))
@@ -343,6 +459,9 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--spec", help="scoring spec TOML (default: the support-desk spec)")
     ev.add_argument("--out-dir", help="also write report.json and report.md here")
 
+    _add_suite_parser(sub)
+    _add_gate_parser(sub)
+
     demo = sub.add_parser("demo", help="record and replay every sample task")
     demo.add_argument("--out-dir", default=".agent-replay/demo")
 
@@ -366,12 +485,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level)
     if args.command == "serve":
         return _serve(args)
+    if args.command == "suite":
+        suite_handlers = {"record": _suite_record}
+        return asyncio.run(suite_handlers[args.suite_command](args))
     handlers = {
         "record": _record,
         "replay": _replay,
         "diff": _diff,
         "score": _score,
         "eval": _eval,
+        "gate": _gate,
         "demo": _demo,
         "ingest": _ingest,
         "stats": _stats,

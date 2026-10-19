@@ -177,7 +177,8 @@ def _ratio(candidate: Usage, baseline: Usage) -> float | None:
     return None
 
 
-def _blocked(actions: tuple[Action, ...], trajectory: Trajectory) -> list[Action]:
+def blocked_side_effects(actions: tuple[Action, ...], trajectory: Trajectory) -> list[Action]:
+    """Side-effecting calls that matched no recording, so the replay sandbox did not run them."""
     blocked_steps = {
         step.index for step in trajectory.tool_steps if step.result.error_type == BLOCKED_ERROR_TYPE
     }
@@ -249,7 +250,7 @@ def run_checks(
             ratio=cost.ratio,
         )
     if config.blocked_writes != "off":
-        blocked = _blocked(actions, trajectory)
+        blocked = blocked_side_effects(actions, trajectory)
         first = blocked[0] if blocked else None
         add(
             "blocked_writes",
