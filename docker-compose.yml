@@ -1,7 +1,41 @@
-# Local dependencies. The application service is added with the Dockerfile on day 6.
+# The receiver and read API with PostgreSQL.
+#   docker compose up -d --build
+#   curl -s localhost:4318/healthz
+#   agent-replay record --task "Please refund ORD-1003." --out run.json --otlp-out spans.json
+#   curl -s -H 'Content-Type: application/json' --data-binary @spans.json localhost:4318/v1/traces
+#   docker compose run --rm maintain     # (profile "maintenance") prune the span buffer and sweep orphaned blobs
+# Only the database for local development and tests:
 #   docker compose up -d postgres
 #   export AGENT_REPLAY_DATABASE_URL=postgresql://agent_replay:agent_replay@localhost:5432/agent_replay
+x-app: &app
+  build: .
+  image: agent-replay:local
+  environment:
+    AGENT_REPLAY_DATABASE_URL: postgresql://agent_replay:agent_replay@postgres:5432/agent_replay
+    AGENT_REPLAY_INGEST_TOKEN: ${AGENT_REPLAY_INGEST_TOKEN:-}
+    AGENT_REPLAY_READ_TOKEN: ${AGENT_REPLAY_READ_TOKEN:-}
+    AGENT_REPLAY_LOG_LEVEL: ${AGENT_REPLAY_LOG_LEVEL:-INFO}
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
+  app:
+    <<: *app
+    ports:
+      - "127.0.0.1:4318:4318"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+  maintain:
+    <<: *app
+    profiles: ["maintenance"]
+    command: ["maintain", "--span-retention-hours", "72", "--blob-grace-hours", "1"]
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -9,7 +43,7 @@ services:
       POSTGRES_PASSWORD: agent_replay  # local development only
       POSTGRES_DB: agent_replay
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agent_replay"]
       interval: 5s

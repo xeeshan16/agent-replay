@@ -119,3 +119,31 @@ jobs:
             --out "$RUNNER_TEMP/run.json" --otlp-out "$RUNNER_TEMP/spans.json"
           agent-replay ingest "$RUNNER_TEMP/spans.json" --database-url "$AGENT_REPLAY_TEST_DATABASE_URL"
           agent-replay stats --database-url "$AGENT_REPLAY_TEST_DATABASE_URL"
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the stack (app + PostgreSQL), wait for health checks
+        run: docker compose up -d --build --wait app
+
+      - name: Smoke test (OTLP over HTTP into the container, read back, maintenance)
+        run: |
+          curl -fsS localhost:4318/healthz
+          docker compose exec -T app agent-replay record --task "Please refund ORD-1003." \
+            --out /tmp/run.json --otlp-out /tmp/spans.json > /dev/null
+          docker compose exec -T app cat /tmp/spans.json > "$RUNNER_TEMP/spans.json"
+          curl -fsS -H 'Content-Type: application/json' \
+            --data-binary @"$RUNNER_TEMP/spans.json" localhost:4318/v1/traces
+          curl -fsS localhost:4318/v1/trajectories \
+            | python3 -c 'import json, sys; runs = json.load(sys.stdin); assert len(runs) == 1, runs'
+          docker compose run --rm maintain
+          docker compose exec -T app id -u | grep -qv '^0$'  # not root
+
+      - name: Logs and teardown
+        if: always()
+        run: |
+          docker compose logs --no-color
+          docker compose down -v

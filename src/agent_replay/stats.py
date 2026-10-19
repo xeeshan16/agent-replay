@@ -11,7 +11,7 @@ against a non-deterministic model. Two facts shape the statistics:
   has a success rate of 1.0 and the interval is ``[1.0, 1.0]``: no uncertainty at all from
   seven tasks, which is wrong. The Wilson score interval does not have that problem (seven out
   of seven gives a 95% lower bound of about 0.65). The gate therefore uses the *lower* of the
-  two lower bounds (see ADR 0005).
+  two lower bounds (see "Design trade-offs" in the README).
 
 Everything is stdlib-only and seeded, so a gate report is reproducible bit for bit.
 """
