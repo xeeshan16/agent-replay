@@ -39,6 +39,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from agent_replay.accounting import DEFAULT_PRICES, PriceTable
 from agent_replay.agent import ToolCallingAgent
 from agent_replay.clock import TickingClock
 from agent_replay.diff import TrajectoryDiff, diff_trajectories
@@ -52,6 +53,8 @@ from agent_replay.logs import configure_logging
 from agent_replay.matching import MatchMode, MatchPolicy
 from agent_replay.model import Trajectory
 from agent_replay.normalize import Normalizer
+from agent_replay.providers.base import LLMProvider
+from agent_replay.providers.config import provider_from_env
 from agent_replay.recorder import record_run
 from agent_replay.reference import support_desk
 from agent_replay.replay import ReplayMode, ReplayResult, replay
@@ -68,6 +71,7 @@ NORMALIZERS: dict[str, Normalizer] = {
     "support-desk": support_desk.NORMALIZER,
 }
 
+LLM_HELP = "fake: the deterministic reference policies; env: AGENT_REPLAY_LLM_* (see README)"
 DB_HELP = "PostgreSQL URL (default: $AGENT_REPLAY_DATABASE_URL, else in-memory)"
 
 EXIT_OK = 0
@@ -112,8 +116,35 @@ def _replay_report(result: ReplayResult, diff: TrajectoryDiff) -> dict[str, obje
     }
 
 
+def _env_llm(prices: PriceTable = DEFAULT_PRICES) -> LLMProvider:
+    llm = provider_from_env(prices=prices)
+    if llm is None:
+        raise SystemExit(
+            "--llm env / --judge env need AGENT_REPLAY_LLM_PROVIDER set to a real provider"
+        )
+    return llm
+
+
+def _describe(llm: LLMProvider | None, fake_model: str) -> str:
+    if llm is None:
+        return f"fake {fake_model}"
+    model = os.environ.get("AGENT_REPLAY_LLM_MODEL") or "default model"
+    return f"{llm.provider_name} {model}"
+
+
+def _real(llm: LLMProvider) -> LLMProvider | None:
+    return None if llm.provider_name == "fake" else llm
+
+
+def _judge(choice: str, spec: ScoringSpec) -> LLMProvider | None:
+    if choice == "none":
+        return None
+    return _env_llm(spec.price_table) if choice == "env" else support_desk.build_judge()
+
+
 async def _record(args: argparse.Namespace) -> int:
-    agent = support_desk.build_agent(policy=POLICIES[args.policy])
+    llm = _env_llm() if args.llm == "env" else None
+    agent = support_desk.build_agent(policy=POLICIES[args.policy], llm=llm)
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -186,7 +217,7 @@ async def _score(args: argparse.Namespace) -> int:
     spec = _load_spec(args.spec)
     if args.no_judge:
         spec = spec.model_copy(update={"judge": spec.judge.model_copy(update={"enabled": False})})
-    card = await score(candidate, spec, baseline=baseline, judge=support_desk.build_judge())
+    card = await score(candidate, spec, baseline=baseline, judge=_judge(args.judge, spec))
     text = render_scorecard(card) if args.format == "md" else json.dumps(card.to_report(), indent=2)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
@@ -306,12 +337,13 @@ async def _load_gate_suite(args: argparse.Namespace) -> Suite:
 async def _gate(args: argparse.Namespace) -> int:
     suite = await _load_gate_suite(args)
     spec = _load_spec(args.spec)
-    judge = None if args.no_judge else support_desk.build_judge()
+    judge = None if args.no_judge else _judge(args.judge, spec)
     policy = POLICIES[args.policy]
+    llm = _env_llm(spec.price_table) if args.llm == "env" else None
 
     def candidate(case_id: str, repeat: int) -> ToolCallingAgent:
         return support_desk.build_agent(
-            policy=policy, id_factory=support_desk.seeded_ids(f"{case_id}/{repeat}")
+            policy=policy, llm=llm, id_factory=support_desk.seeded_ids(f"{case_id}/{repeat}")
         )
 
     report = await run_gate(
@@ -324,10 +356,9 @@ async def _gate(args: argparse.Namespace) -> int:
         repeats=args.repeats,
         concurrency=args.concurrency,
         settings=ReplaySettings(),
-        candidate=f"support-desk policy {args.policy}",
-        provider=f"fake (agent {support_desk.MODEL}"
-        + ("" if judge is None else f", judge {spec.judge.model}")
-        + "); no network",
+        candidate="support-desk " + ("(model from env)" if llm else f"policy {args.policy}"),
+        provider=f"agent {_describe(llm, support_desk.MODEL)}"
+        + ("" if judge is None else f", judge {_describe(_real(judge), spec.judge.model)}"),
     )
     markdown = render_gate_markdown(report)
     _write(args.markdown, markdown)
@@ -453,6 +484,13 @@ def _add_gate_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -
     gate.add_argument("--min-success-rate", type=float)
     gate.add_argument("--max-cost-ratio", type=float)
     gate.add_argument("--no-judge", action="store_true", help="skip the judge layer")
+    gate.add_argument(
+        "--llm",
+        choices=["fake", "env"],
+        default="fake",
+        help=LLM_HELP,
+    )
+    gate.add_argument("--judge", choices=["fake", "env", "none"], default="fake")
     gate.add_argument("--markdown", help="write the Markdown report here")
     gate.add_argument("--junit", help="write a JUnit XML report here")
     gate.add_argument("--json", help="write the full JSON report here")
@@ -498,6 +536,12 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--out", required=True)
     rec.add_argument("--policy", choices=sorted(POLICIES), default="v1")
     rec.add_argument(
+        "--llm",
+        choices=["fake", "env"],
+        default="fake",
+        help=LLM_HELP,
+    )
+    rec.add_argument(
         "--otlp-out", help="also write the run's spans (with content) as an OTLP/JSON request"
     )
 
@@ -538,6 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
     sco.add_argument("--baseline", help="baseline run, for cost-regression checks")
     sco.add_argument("--spec", help="scoring spec TOML (default: the support-desk spec)")
     sco.add_argument("--no-judge", action="store_true", help="skip the judge layer")
+    sco.add_argument("--judge", choices=["fake", "env", "none"], default="fake")
     sco.add_argument("--format", choices=["md", "json"], default="md")
     sco.add_argument("--out", help="write the scorecard here instead of standard output")
 
