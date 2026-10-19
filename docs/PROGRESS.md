@@ -250,3 +250,60 @@ diff with the scorecard (see PLAN.md).
 **Next (Day 6)**: `agent-replay gate` with thresholds and bootstrap confidence intervals over a
 suite, JUnit and Markdown reports, the read API for suites and diffs, span-buffer retention and
 blob sweep, Dockerfile and docker-compose, and optional real providers.
+
+## Day 6 — 2026-10-19: CI gate, API and packaging
+
+**Shipped**
+
+- `suite.py`: baseline suites, a directory with a `suite.json` manifest pinning each case's
+  behavioural fingerprint. `load_suite` refuses edited baselines and case files that resolve
+  outside the suite directory. `agent-replay suite record` and `suite push`.
+- `stats.py`: seeded, stdlib-only cluster bootstrap (resamples tasks, uses each task's mean over
+  its repeats), paired bootstrap for the success change, and the Wilson score interval.
+- `gate.py`: replays a candidate against every case `--repeats` times with bounded concurrency,
+  diffs and scores each replay, and classifies samples `pass`, `changed`, `inconclusive`, `fail`
+  or `error` (harness failures are reported, never dropped). Thresholds: paired success drop,
+  optional success-rate floor on the lower of the bootstrap and Wilson bounds, suite cost and
+  tool-call ratios, blocked side effects, errors, optionally inconclusive samples. Thresholds
+  load from a `[gate]` TOML table with CLI overrides; one OTel span per gate and per sample.
+- `gate_report.py`: Markdown, JUnit XML (cases and thresholds as separate test suites) and JSON;
+  untrusted text escaped in Markdown and control characters stripped for XML.
+  `agent-replay gate --baseline DIR | --suite NAME` exits 1 on a breach.
+- Store: suites with revisions (accepted only when every case's trajectory is stored with the
+  pinned fingerprint); span-buffer retention that tombstones idle traces so straggler spans are
+  counted as `spans_expired` instead of re-assembling a fragment; mark-and-sweep of blobs under
+  an exclusive advisory lock that every save takes in shared mode. `agent-replay maintain`.
+- Read API: `/v1/suites[/{name}]`, `/v1/diff?baseline=&candidate=&format=json|md`, trajectory
+  IDs containing slashes, and an optional read token separate from the ingest token.
+- `providers/http.py` + `providers/config.py`: OpenAI-compatible (OpenAI, Azure OpenAI, Ollama,
+  vLLM) and Anthropic clients behind the provider interface, error classification for the
+  retry wrapper, `AGENT_REPLAY_LLM_*` configuration, `--llm env` / `--judge env`. Not used by
+  tests, CI or the demo.
+- `Dockerfile` (multi-stage, non-root, health check), docker-compose with the app, PostgreSQL
+  and a maintenance job; a CI job builds the image, starts the stack, sends a recorded run over
+  OTLP/HTTP into the container, reads it back and runs maintenance. CI also gates an identical
+  candidate (must pass) and `skip-lookup` (must breach on `unsafe_actions`).
+
+**Verified locally** (Python 3.12, PostgreSQL 16, fake providers): ruff and format clean, mypy
+strict clean (86 files), 345 tests passing including the PostgreSQL tests, 98% line coverage.
+The installed wheel was exercised outside the source tree (record, suite, gate, serve + ingest +
+read). The Docker image could not be built in this workspace (Docker Hub is not reachable from
+it); it was built and smoke-tested by the new CI job, which passed.
+
+A mutation check on the sweep lock: with the shared lock removed from saves, the concurrent
+sweep-and-save test failed in 4 of 4 runs; with it, it passed 6 of 6.
+
+**Measured** with `agent-replay gate` on a 7-task suite recorded from `v1` (fake agent and
+judge, default thresholds): `v1` passes; `amount-drift`, `skip-lookup`, `loop-lookup`,
+`ignore-eligibility` and `false-claim` breach (success drop, plus unsafe actions, cost or
+tool-call ratios as applicable); `no-retry` passes with its changed case listed for review; the
+benign `check-policy` breaches on cost (one case fails its 1.5x per-run budget, suite cost
+1.27x). Full table in the README. A gate with `--repeats 5` takes about 0.5 s.
+
+**Plan adjustment**: the gate's statistical choices are documented under "Design trade-offs" in
+the README rather than in a fifth ADR, to keep the ADR set to the four decisions that shaped the
+storage and replay core.
+
+**Next (Day 7)**: final evaluation (regression-detection precision and recall, first-divergence
+localisation, replay determinism rate across processes), README polish with the measured
+results table, limitations and next steps, and a clean-clone quick-start check.

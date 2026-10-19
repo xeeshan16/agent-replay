@@ -32,3 +32,8 @@ One milestone per day. Each day ships working, tested code; Day 7 is evaluation,
   the diff and the scorecard answer different questions (the diff flags benign changes, scoring
   misses regressions no rule describes), so Day 6's gate takes both: it fails on a scorecard
   failure, and reports divergences with no failing finding as "changed, needs review".
+- Day 6 (2026-10-19): everything in the Day 6 row shipped. Two additions: suites live in the
+  store as well as on disk (so CI can gate without checked-in baselines), and retention closes
+  traces with a tombstone rather than only deleting spans, because deleting alone lets a late
+  span rebuild a fragment over a complete trajectory. The gate's statistics are documented in
+  the README's design trade-offs instead of a new ADR.

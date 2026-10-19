@@ -4,7 +4,7 @@
 
 **Record, replay and regression-gate AI agent trajectories.**
 
-> Status: 🚧 in progress (day 5 of 7). See [docs/PLAN.md](docs/PLAN.md) and
+> Status: 🚧 in progress (day 6 of 7). See [docs/PLAN.md](docs/PLAN.md) and
 > [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## The problem
@@ -19,7 +19,7 @@ then replays new agent versions against the **recorded world**: tool results com
 cassette, so runs are deterministic, free and side-effect-safe. Trajectories are diffed to the
 first divergence, scored in layers, and a CI gate fails the build on regressions.
 
-## Architecture (target)
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -51,12 +51,14 @@ flowchart LR
     SP[Scoring spec TOML<br/>budgets, rules, judge] --> SC
     JD[Judge LLMProvider] -. only if cheaper layers pass .-> SC
     SC --> SCD[Scorecard<br/>verdict, findings, costs]
-    D -.-> G[CI gate]
-    SCD -.-> G
-    G -.-> J[JUnit + Markdown report]
+    SU[(Baseline suite<br/>pinned fingerprints)] --> G
+    S --> SU
+    D --> G[CI gate<br/>bootstrap + Wilson CIs,<br/>thresholds]
+    SCD --> G
+    G --> J[JUnit / Markdown / JSON<br/>exit 1 on breach]
+    S --> API[Read API<br/>/v1/trajectories, /v1/suites, /v1/diff]
+    MT[maintain<br/>retention + blob sweep] --> S
 ```
-
-Solid lines exist today; dotted lines are planned (see the plan).
 
 ## What works today
 
@@ -147,6 +149,30 @@ Solid lines exist today; dotted lines are planned (see the plan).
   re-delivered spans are dropped, and each touched trace is re-assembled from all its spans, so
   out-of-order batches converge and a late child span becomes a new revision of the same record.
   See [ADR 0002](docs/adr/0002-otlp-ingest-span-buffer.md).
+- **CI gate** (`gate.py`, `stats.py`, `gate_report.py`): replays a candidate against every case
+  of a baseline suite (optionally `--repeats N` times, concurrently), diffs and scores each
+  replay, and classifies it `pass`, `changed` (diverged but the scorecard passed: needs a human
+  look, does not breach), `inconclusive`, `fail` or `error`. Suite-level thresholds: the lower
+  bound of a paired cluster-bootstrap CI on the success change, an optional success-rate floor
+  taken as the lower of the bootstrap and Wilson bounds, suite cost and tool-call ratios, blocked
+  side effects and harness errors. Reports as Markdown (job summary), JUnit XML (one test per
+  case plus one per threshold) and JSON; exit 1 on a breach. Seeded, so reports reproduce.
+- **Baseline suites** (`suite.py`): a directory with a `suite.json` manifest that pins each
+  case's behavioural fingerprint; an edited or truncated baseline is refused. Suites can be
+  pushed to the store and gated from there (`gate --suite NAME`).
+- **Read API** (`server.py`): `GET /v1/trajectories[/{id}]`, `/v1/suites[/{name}]` and
+  `/v1/diff?baseline=&candidate=&format=json|md`, optionally behind its own bearer token.
+- **Retention and blob sweep** (`store/`, `agent-replay maintain`): traces idle past the
+  retention are closed with a tombstone (a straggler span is dropped instead of rebuilding a
+  fragment over the complete run), and blobs no stored trajectory reaches are swept under an
+  advisory lock that saves share, so a sweep is safe during ingest.
+- **Real providers, optional** (`providers/http.py`, `providers/config.py`): an
+  OpenAI-compatible client (OpenAI, Azure OpenAI, Ollama, vLLM) and an Anthropic client behind
+  the same interface, wrapped in the retry/timeout layer and selected with `AGENT_REPLAY_LLM_*`
+  (`record --llm env`, `gate --llm env`, `--judge env`). Never used by tests, CI or the demo.
+- **Packaging**: a multi-stage, non-root Docker image with a health check, and docker-compose
+  with the app, PostgreSQL and a maintenance job; CI builds the image and sends a run through
+  the running container.
 - **Storage** (`store/`): one `TrajectoryStore` interface, an in-memory implementation and a
   PostgreSQL one (async SQLAlchemy Core + asyncpg). Messages, tool definitions and tool payloads
   are content-addressed blobs shared across turns and runs; reads verify the fingerprint. See
@@ -192,6 +218,44 @@ agent-replay score unsafe.json --baseline run.json          # --spec my.toml, --
 
 # Run the labelled regression-detection eval (about a second, no keys)
 agent-replay eval --out-dir evals/results
+
+# Gate a candidate against a baseline suite: exit 0 if every threshold holds, 1 on a breach
+agent-replay suite record --out-dir suites/desk-v1 --name desk-v1   # 7 sample tasks, v1
+agent-replay gate --baseline suites/desk-v1 --policy skip-lookup \
+  --markdown gate.md --junit gate.xml --json gate.json        # --repeats 5, --config gate.toml
+```
+
+Excerpt of `gate.md` for the `skip-lookup` candidate (real output):
+
+```markdown
+### Agent gate: BREACHED
+
+Success rate 0.286 (baseline 1.000); 95% CI bootstrap [0.000, 0.571], Wilson [0.082, 0.641].
+Change vs baseline -0.714, 95% CI [-1.000, -0.429].
+
+| Threshold | Result | Value | Limit | Detail |
+|-----------|--------|-------|-------|--------|
+| success_drop | BREACH | -1.0 | -0.1 | success change -0.714, 95% CI [-1.000, -0.429]; lower bound must be &gt;= -0.100 |
+| cost_ratio | ok | 1.0015 | 1.25 | suite cost 1.00x the baseline's (max 1.25x) |
+| tool_call_ratio | ok | 1.0909 | 1.5 | 1.09x the baseline's tool calls (max 1.50x) |
+| unsafe_actions | BREACH | 5 | 0 | 5 side-effecting call(s) matched no recording and were blocked (max 0) |
+| errors | ok | 0 | 0 | 0 sample(s) could not be run (max 0) |
+```
+
+Thresholds live in a `[gate]` table (all optional; shown with their defaults):
+
+```toml
+[gate]
+max_success_drop = 0.10     # lower CI bound of (candidate - baseline) success must be >= -0.10
+min_success_rate = 0.90     # off by default; checked against the conservative lower bound
+max_cost_ratio = 1.25       # suite cost vs the baseline's (tokens when models are unpriced)
+max_tool_call_ratio = 1.5
+max_unsafe_actions = 0      # side-effecting calls the sandbox had to block
+max_errors = 0
+fail_on_inconclusive = false
+confidence = 0.95
+resamples = 2000
+seed = 0
 ```
 
 Excerpt of `diff.md` from the `amount-drift` replay above (real output, line-wrapped):
@@ -239,6 +303,34 @@ Point any OpenTelemetry SDK at it with
 the instrumentation to get replayable trajectories. Stored runs are readable at
 `GET /v1/trajectories` and `GET /v1/trajectories/{id}`.
 
+### Run the service with Docker
+
+```bash
+docker compose up -d --build            # app on 127.0.0.1:4318 + PostgreSQL
+curl -s localhost:4318/healthz
+curl -s -H 'Content-Type: application/json' --data-binary @spans.json localhost:4318/v1/traces
+
+# Push a suite, then gate against it from any CI job that can reach the database
+agent-replay suite push suites/desk-v1
+agent-replay gate --suite desk-v1 --policy amount-drift
+curl -s "localhost:4318/v1/diff?baseline=desk-v1/01-i-d-like-a-refund&candidate=<id>&format=md"
+
+# Housekeeping: close traces idle for 72 h, sweep unreferenced blobs older than 1 h
+docker compose run --rm maintain        # or: agent-replay maintain --span-retention-hours 72
+```
+
+### Real model providers (optional)
+
+```bash
+export AGENT_REPLAY_LLM_PROVIDER=ollama AGENT_REPLAY_LLM_MODEL=llama3.1   # or openai, azure, anthropic
+agent-replay record --llm env --task "Please refund ORD-1003." --out real.json
+agent-replay gate --baseline suites/desk-v1 --llm env --judge env --repeats 5
+```
+
+Prices for real models are not bundled; add a `[prices.<model>]` table to the scoring spec to
+get costs (ratios fall back to tokens otherwise). Nothing in this README's results used a real
+provider.
+
 ### Configuration
 
 | Variable | Default | Purpose |
@@ -246,7 +338,11 @@ the instrumentation to get replayable trajectories. Stored runs are readable at
 | `AGENT_REPLAY_DATABASE_URL` | unset (in-memory) | PostgreSQL URL for `serve`, `ingest`, `stats` |
 | `AGENT_REPLAY_INGEST_TOKEN` | unset (open) | Require `Authorization: Bearer <token>` on `POST /v1/traces` |
 | `AGENT_REPLAY_CAPTURE_CONTENT` | `false` | Put prompts, tool arguments and results on recorder spans |
+| `AGENT_REPLAY_READ_TOKEN` | unset (open) | Require a bearer token on the read API |
 | `AGENT_REPLAY_LOG_LEVEL` | `WARNING` | JSON log level |
+| `AGENT_REPLAY_LLM_PROVIDER` | `fake` | `fake`, `openai`, `azure`, `ollama` or `anthropic` |
+| `AGENT_REPLAY_LLM_MODEL`, `_BASE_URL`, `_API_KEY`, `_API_VERSION` | unset | Real-provider settings (see `.env.example`) |
+| `AGENT_REPLAY_LLM_TIMEOUT_S`, `_MAX_ATTEMPTS` | `60`, `3` | Per-attempt timeout and retries |
 
 ## Design trade-offs
 
@@ -271,7 +367,27 @@ the instrumentation to get replayable trajectories. Stored runs are readable at
 - **Diff and scoring answer different questions.** The diff flags every behaviour change, so it
   also flags benign ones (5 of 5 in the eval); scoring judges whether a run is acceptable, and
   misses regressions it has no rule for (`no-retry`: giving up on a transient failure produces a
-  polite, grounded answer that breaks no rule). The CI gate (Day 6) combines them.
+  polite, grounded answer that breaks no rule). The CI gate combines them: a scorecard failure
+  fails the case, a divergence with a passing scorecard is reported as `changed` for review.
+- **Resample tasks, not runs.** With `--repeats`, runs of one task are correlated (a task the
+  candidate gets wrong it tends to get wrong every time). The gate's bootstrap resamples tasks
+  and uses each task's mean, so ten repeats of one flaky task do not count as ten pieces of
+  evidence; the success change is bootstrapped *paired* by task, so a task both versions fail
+  adds nothing.
+- **Take the lower of two lower bounds.** The percentile bootstrap collapses to `[1, 1]` when
+  every task passes; Wilson does not (7/7 gives about 0.65 at 95%). The success-rate floor uses
+  the lower of the two, which is why it is off by default: on a 7-task suite even a perfect run
+  cannot prove 0.9. Small suites should rely on `max_success_drop` and per-case failures, and
+  grow the suite before tightening the floor.
+- **Retention closes traces instead of trimming them.** Deleting old spans alone would let a
+  late re-delivered span re-assemble a one-span fragment over the complete trajectory; a
+  tombstone makes the late span a counted, harmless drop (`spans_expired`).
+- **Sweep with a lock, not reference counts.** Blobs are referenced from steps and from inside
+  other blobs, so there is no cascade to lean on and counts would have to be maintained on every
+  save. Mark-and-sweep under an exclusive advisory lock, with every save holding it shared, is
+  simple and provably safe against a concurrent save reusing a blob; the cost is that saves
+  wait for a running sweep, and marking reads every request blob (fine at this scale, to be
+  made incremental for large stores).
 - **Relative cost budgets have a price.** `max_cost_ratio = 1.5` caught a lookup loop the
   invariants also caught, and failed two benign changes whose extra read is a large share of a
   short baseline run. The threshold is set by policy, not tuned on the eval.
@@ -321,6 +437,19 @@ AGENT_REPLAY_TEST_DATABASE_URL=postgresql://agent_replay:agent_replay@localhost:
   without removing it, which is why the judge runs last, cannot overturn a deterministic
   failure, and anything but a valid verdict counts as inconclusive. Judge requests carry
   recorded content to the judge's provider: use a provider approved for that data.
+- The read API returns prompts and tool outputs. Set `AGENT_REPLAY_READ_TOKEN`; it is separate
+  from the ingest token so a span exporter's credential cannot read data back.
+- Real-provider API keys are read from the environment, sent only as request headers, and never
+  logged or included in error messages (response bodies quoted in errors are truncated). `--llm
+  env` and `--judge env` send recorded content to that provider.
+- Gate reports quote untrusted text too: Markdown cells are escaped as above, and JUnit XML is
+  built with ElementTree after stripping control characters XML 1.0 cannot carry, so a hostile
+  tool output cannot produce a report the CI test viewer refuses to parse.
+- Suites pin each baseline's fingerprint and refuse case files that resolve outside the suite
+  directory, so a tampered or path-traversing manifest fails loudly instead of changing what the
+  gate compares against.
+- The container runs as an unprivileged user with a read-only root filesystem in compose, and
+  compose binds ports to localhost only.
 - Recorded tool outputs are untrusted input to the agent under test (they may contain prompt
   injection captured from the real world); replay reproduces them faithfully on purpose.
 
@@ -342,6 +471,25 @@ The layered verdict missed `no-retry` on the flaky order; its two false positive
 benign extra read failing the cost-ratio budget. The first divergence named the labelled
 decision step in 23 of 23 changed cases. These numbers describe detection of seeded regressions
 on one small deterministic agent, not real-model behaviour; day 7 adds the final evaluation.
+
+Measured on day 6 with `agent-replay gate` against a 7-task suite recorded from `v1` (fake agent
+and judge, default thresholds, one repeat; deterministic, so repeats change nothing here):
+
+| Candidate | Verdict | pass / changed / fail | Success [95% Wilson] | Change vs baseline [95% CI] | Cost ratio | Breached |
+|---|---|---|---|---|---|---|
+| `v1` | pass | 7 / 0 / 0 | 1.00 [0.65, 1.00] | +0.00 [+0.00, +0.00] | 1.00 | none |
+| `check-policy` (benign) | breach | 3 / 3 / 1 | 0.86 [0.49, 0.97] | -0.14 [-0.43, +0.00] | 1.27 | success_drop, cost_ratio |
+| `no-retry` | pass | 6 / 1 / 0 | 1.00 [0.65, 1.00] | +0.00 [+0.00, +0.00] | 0.85 | none |
+| `amount-drift` | breach | 6 / 0 / 1 | 0.86 [0.49, 0.97] | -0.14 [-0.43, +0.00] | 1.00 | success_drop, unsafe_actions |
+| `skip-lookup` | breach | 2 / 0 / 5 | 0.29 [0.08, 0.64] | -0.71 [-1.00, -0.43] | 1.00 | success_drop, unsafe_actions |
+| `loop-lookup` | breach | 2 / 0 / 5 | 0.29 [0.08, 0.64] | -0.71 [-1.00, -0.29] | 1.60 | success_drop, cost_ratio, tool_call_ratio |
+| `ignore-eligibility` | breach | 6 / 0 / 1 | 0.86 [0.49, 0.97] | -0.14 [-0.43, +0.00] | 1.08 | success_drop, unsafe_actions |
+| `false-claim` | breach | 6 / 0 / 1 | 0.86 [0.49, 0.97] | -0.14 [-0.43, +0.00] | 0.99 | success_drop |
+
+Every seeded regression but `no-retry` breaches; `no-retry` passes the gate but its changed case
+is listed for review, which is the honest outcome when no rule describes the regression. The
+benign `check-policy` breaches on cost, the same trade-off as in the eval. A gate over the suite
+with `--repeats 5` took about 0.5 s on this machine.
 
 ## License
 
