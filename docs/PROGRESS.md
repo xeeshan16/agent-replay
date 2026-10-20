@@ -307,3 +307,49 @@ storage and replay core.
 **Next (Day 7)**: final evaluation (regression-detection precision and recall, first-divergence
 localisation, replay determinism rate across processes), README polish with the measured
 results table, limitations and next steps, and a clean-clone quick-start check.
+
+## Day 7 — 2026-10-20: final evaluation, polish and docs
+
+**Shipped**
+
+- `determinism.py` + `agent-replay determinism`: cross-process replay determinism. Each pair
+  runs a record worker and a replay worker as separate interpreters, with different
+  `PYTHONHASHSEED` values and in different wall-clock seconds, using the real clock and random
+  IDs. It counts identical runs for two independent live runs, FULL and TOOLS replay under each
+  normaliser, and the OTLP round trip (exact fingerprint after re-assembly from exported spans,
+  then FULL replay). Exit 1 unless the agent's own normaliser is stable in every cell; CI runs
+  it with three pairs and publishes the table to the job summary. This replaces the ad hoc
+  measurement behind the Day 3 table with a command anyone can run.
+- README: status, "How it works", the final results section (regression detection,
+  localisation, determinism, gate, with dataset, provider and settings), limitations and what
+  I'd do next. `evals/README.md` documents the determinism harness.
+
+**Verified locally** (Python 3.12, PostgreSQL 16, fake providers): ruff and format clean, mypy
+strict clean (88 files), 351 tests passing including the PostgreSQL tests, 98% line coverage.
+Quick start checked from a clean clone of `main` in a fresh virtualenv: every command in it ran
+with the documented exit code, and the test suite passed there (PostgreSQL tests skipped
+without a database).
+
+**Measured** (fake agent `fake-tool-caller-1`, fake judge `fake-judge-1`):
+
+- `agent-replay eval`: unchanged from Day 5. Layered verdict precision 0.89, recall 0.94
+  (17/18), F1 0.92; first divergence on the labelled decision step in 23/23 changed cases.
+- `agent-replay determinism --pairs 10` (70 runs per cell):
+
+  | Normaliser | Live re-run | FULL replay | TOOLS replay |
+  |------------|-------------|-------------|--------------|
+  | none | 40/70 | 0/70 | 40/70 |
+  | default | 42/70 | 70/70 | 62/70 |
+  | support-desk | 70/70 | 70/70 | 70/70 |
+
+  OTLP round trip 70/70 (fingerprint) and 70/70 (FULL replay). The Day 3 table (35 replays
+  per cell) showed the same pattern; the default normaliser's TOOLS misses are ticket tags in
+  hash-seed order.
+- `agent-replay gate`: re-ran every candidate against a fresh `v1` suite; verdicts and exit
+  codes match the Day 6 table.
+
+**Plan adjustment**: none. All seven milestones shipped; the eval harness had moved in on Day 5,
+so Day 7 added the one missing measurement (cross-process determinism) as code rather than a
+script.
+
+**Status**: complete.

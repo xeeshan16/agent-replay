@@ -34,3 +34,17 @@ detectors catch the regression types it seeds and stay quiet on the controls, no
 model's run-to-run variance affects them. The judge in this eval is a deterministic stand-in
 that applies the rubric's grounding rules; a real model judge would need its own agreement
 study before its numbers mean anything.
+
+## Replay determinism (`agent-replay determinism`)
+
+No dataset file: the harness uses the reference agent's 7 sample tasks
+(`agent_replay.reference.support_desk.SAMPLE_TASKS`). Each *pair* runs two interpreters one
+after the other, with different `PYTHONHASHSEED` values and in different wall-clock seconds:
+the first records every task live (real clock, random IDs, OTLP spans with content), the second
+records them live again and replays the first one's recordings in FULL and TOOLS mode under the
+`none`, `default` and `support-desk` normalisers, and rebuilds each recording from its spans.
+
+Reported per normaliser: identical live re-runs, identical FULL replays, identical TOOLS
+replays; plus OTLP rebuilds with the exact fingerprint and their FULL replays. The command
+exits 1 unless the `support-desk` normaliser and the OTLP round trip are identical in every
+run. `--pairs 10` takes about 10 seconds.

@@ -4,8 +4,8 @@
 
 **Record, replay and regression-gate AI agent trajectories.**
 
-> Status: 🚧 in progress (day 6 of 7). See [docs/PLAN.md](docs/PLAN.md) and
-> [docs/PROGRESS.md](docs/PROGRESS.md).
+> Status: ✅ complete (built 2026-10-14 → 2026-10-20). See [docs/PLAN.md](docs/PLAN.md),
+> [docs/PROGRESS.md](docs/PROGRESS.md) and the [ADRs](docs/adr/README.md).
 
 ## The problem
 
@@ -60,7 +60,31 @@ flowchart LR
     MT[maintain<br/>retention + blob sweep] --> S
 ```
 
-## What works today
+## How it works
+
+1. **Record.** The recorder wraps an agent's model provider and tool executor. Every model call
+   and tool call becomes a typed step of a `Trajectory` and an OpenTelemetry GenAI span; agents
+   in other frameworks that emit OTel GenAI spans arrive over OTLP/HTTP instead and are
+   re-assembled from their spans.
+2. **Store.** Trajectories go to PostgreSQL with messages and tool payloads as content-addressed
+   blobs, so a 20-turn conversation stores its shared prefix once. Ingest is idempotent per span
+   and re-assembles a trace whenever late spans arrive.
+3. **Replay.** A new agent version runs against the recording's cassette. Each request is
+   normalised (timestamps, UUIDs, minted IDs, unordered lists) and matched exact → normalised →
+   optionally fuzzy. In `TOOLS` mode the new model runs for real and only tools come from the
+   cassette; in `FULL` mode model calls are served too. Every tool call passes a fail-closed
+   sandbox: an unrecorded write is never executed.
+4. **Diff.** Both runs become sequences of requested tool calls, aligned with a weighted edit
+   distance whose substitution cost looks at arguments and results. The first divergence gets a
+   reason (`missing_step`, `argument_drift`, `extra_loop`, ...) and the model step that made the
+   choice.
+5. **Score.** Deterministic checks (status, budgets, cost ratio, blocked writes), then
+   invariants written in a small rule language, then, only if both passed, an LLM judge.
+6. **Gate.** Over a baseline suite, optionally with repeats: per-case classification, paired
+   cluster-bootstrap and Wilson intervals, cost and tool-call ratios, and a non-zero exit on a
+   breach, with Markdown, JUnit and JSON reports.
+
+## Components
 
 - **Trajectory model** (`model.py`): pydantic v2, frozen, mirrors the OpenTelemetry GenAI
   `invoke_agent` → `chat` / `execute_tool` span shape; content fingerprints that ignore IDs,
@@ -136,6 +160,10 @@ flowchart LR
 - **Regression-detection eval** (`evaluation.py`, [evals/](evals/README.md)): 64 labelled
   synthetic cases (every policy on eight tasks) measuring the diff alone, each scoring layer
   alone and the layered verdict as regression detectors.
+- **Determinism harness** (`determinism.py`): records in one interpreter and replays in
+  another, a wall-clock second later and with another hash seed, and reports identical-run
+  rates per normaliser and replay mode plus the OTLP round trip; `agent-replay determinism`
+  exits 1 unless the agent's own normaliser is stable everywhere, and CI runs it.
 - **OTLP receiver** (`server.py`, `ingest/`): `POST /v1/traces` accepts OTLP/HTTP protobuf and
   JSON (optionally gzipped), answers with OTLP partial success for bad spans, 503 + `Retry-After`
   when the store is down, and enforces a body limit (also after decompression) and an optional
@@ -218,6 +246,9 @@ agent-replay score unsafe.json --baseline run.json          # --spec my.toml, --
 
 # Run the labelled regression-detection eval (about a second, no keys)
 agent-replay eval --out-dir evals/results
+
+# Does a recording replay identically in another process, another second, another hash seed?
+agent-replay determinism --pairs 5 --out-dir evals/results     # about 5 s, exit 1 if unstable
 
 # Gate a candidate against a baseline suite: exit 0 if every threshold holds, 1 on a breach
 agent-replay suite record --out-dir suites/desk-v1 --name desk-v1   # 7 sample tasks, v1
@@ -455,25 +486,66 @@ AGENT_REPLAY_TEST_DATABASE_URL=postgresql://agent_replay:agent_replay@localhost:
 
 ## Results
 
-Measured on day 5 with `agent-replay eval` on [`evals/regressions.jsonl`](evals/README.md)
-(64 synthetic cases: 18 regression, 5 benign, 41 no-effect), fake agent and fake judge, the
-bundled support-desk scoring spec, replay in tools mode with live reads and blocked writes:
+Every number below was measured on 2026-10-20 (the gate table on 2026-10-19, with no gate code
+changed since; the verdicts were re-checked on 2026-10-20) by the commands shown, with the
+deterministic fake agent model `fake-tool-caller-1` and fake judge `fake-judge-1`, on Python
+3.12, with no network. They describe this project's reference support-desk agent and seeded
+regressions, not the behaviour of a real model.
 
-| Detector | Precision | Recall | Benign changes flagged |
-|----------|-----------|--------|------------------------|
-| diff (any divergence) | 0.78 | 1.00 | 5/5 |
-| checks only | 0.88 | 0.78 | 2/5 |
-| invariants only | 1.00 | 0.83 | 0/5 |
-| judge only | 1.00 | 0.11 | 0/5 |
-| layered verdict | 0.89 | 0.94 | 2/5 |
+### 1. Regression detection
 
-The layered verdict missed `no-retry` on the flaky order; its two false positives are the
-benign extra read failing the cost-ratio budget. The first divergence named the labelled
-decision step in 23 of 23 changed cases. These numbers describe detection of seeded regressions
-on one small deterministic agent, not real-model behaviour; day 7 adds the final evaluation.
+`agent-replay eval --out-dir evals/results` on [`evals/regressions.jsonl`](evals/README.md):
+64 synthetic cases (every agent policy on eight tasks: 18 regression, 5 benign, 41 no-effect),
+labelled from each policy's definition before any detector ran. Settings: TOOLS replay, live
+reads, unrecorded writes blocked, strict matching with the support-desk normaliser, the bundled
+scoring spec (`max_cost_ratio = 1.5`, six invariants), judge only when checks and invariants
+pass.
 
-Measured on day 6 with `agent-replay gate` against a 7-task suite recorded from `v1` (fake agent
-and judge, default thresholds, one repeat; deterministic, so repeats change nothing here):
+| Detector | TP | FP | FN | TN | Benign flagged | Precision | Recall | F1 |
+|----------|----|----|----|----|----------------|-----------|--------|----|
+| diff (any divergence) | 18 | 5 | 0 | 41 | 5/5 | 0.78 | 1.00 | 0.88 |
+| checks only | 14 | 2 | 4 | 44 | 2/5 | 0.88 | 0.78 | 0.82 |
+| invariants only | 15 | 0 | 3 | 46 | 0/5 | 1.00 | 0.83 | 0.91 |
+| judge only | 2 | 0 | 16 | 46 | 0/5 | 1.00 | 0.11 | 0.20 |
+| **layered verdict** | 17 | 2 | 1 | 44 | 2/5 | **0.89** | **0.94** | **0.92** |
+
+Recall of the layered verdict by regression category: skipped lookup 6/6, extra loop 6/6,
+unsafe write 2/2, argument drift 1/1, unsupported claim 2/2 (only the judge sees these),
+missing retry 0/1. Its two false positives are the benign extra read (`check-policy`) on two
+short runs, where one more read exceeds the 1.5x cost budget.
+
+**Localisation:** the diff's first divergence named the labelled decision step in **23/23**
+changed cases. **Judge spend:** 47 calls and $0.023266 at the illustrative fake prices in the
+layered configuration, against 64 calls and $0.032889 with the judge on every case (29% less).
+
+### 2. Replay determinism across processes
+
+`agent-replay determinism --pairs 10`: each pair records the 7 sample tasks live in one
+interpreter and replays them in another, started in a later wall-clock second with a different
+`PYTHONHASHSEED` (70 runs per cell). "Live re-run" compares two independent live runs of the
+same task, which is what you get without a cassette.
+
+| Normaliser | Live re-run | FULL replay | TOOLS replay |
+|------------|-------------|-------------|--------------|
+| none | 40/70 (57%) | 0/70 (0%) | 40/70 (57%) |
+| default (timestamps, UUIDs, call IDs) | 42/70 (60%) | 70/70 (100%) | 62/70 (89%) |
+| support-desk (default + unordered `tags` + refund IDs) | 70/70 (100%) | 70/70 (100%) | 70/70 (100%) |
+
+OTLP round trip: 70/70 trajectories rebuilt from their exported spans had the recording's exact
+fingerprint, and 70/70 of those replayed identically in FULL mode.
+
+Without normalisation, FULL replay never matches (the system prompt carries the time), and
+TOOLS replay and live re-runs fail whenever a ticket ID or refund key was minted. The default
+normaliser fixes the time and UUIDs; the remaining TOOLS misses are ticket tags coming out of a
+set in hash-seed order. The agent's own normaliser is stable everywhere. With a deterministic
+fake model, a live re-run is as stable as a replay once normalised; what the replay adds here is
+that no tool is ever executed and no order store is needed. With a real model, the live column
+would also carry sampling variance, which this table does not measure.
+
+### 3. CI gate
+
+`agent-replay gate` against a 7-task suite recorded from `v1` (default thresholds, one repeat;
+the fake model is deterministic, so repeats change nothing here):
 
 | Candidate | Verdict | pass / changed / fail | Success [95% Wilson] | Change vs baseline [95% CI] | Cost ratio | Breached |
 |---|---|---|---|---|---|---|
@@ -486,10 +558,54 @@ and judge, default thresholds, one repeat; deterministic, so repeats change noth
 | `ignore-eligibility` | breach | 6 / 0 / 1 | 0.86 [0.49, 0.97] | -0.14 [-0.43, +0.00] | 1.08 | success_drop, unsafe_actions |
 | `false-claim` | breach | 6 / 0 / 1 | 0.86 [0.49, 0.97] | -0.14 [-0.43, +0.00] | 0.99 | success_drop |
 
-Every seeded regression but `no-retry` breaches; `no-retry` passes the gate but its changed case
-is listed for review, which is the honest outcome when no rule describes the regression. The
-benign `check-policy` breaches on cost, the same trade-off as in the eval. A gate over the suite
-with `--repeats 5` took about 0.5 s on this machine.
+Every seeded regression but `no-retry` breaches; `no-retry` passes with its changed case listed
+for review, the honest outcome when no rule describes the regression. The benign `check-policy`
+breaches on cost, the same trade-off as in the eval. A gate with `--repeats 5` takes about
+0.5 s.
+
+**Performance notes** (this machine, not a benchmark): diffing 200 x 200 synthetic actions takes
+about 40 ms; the full regression eval about a second; ten determinism pairs about 10 s, most of
+it interpreter start-up. Storage on the five Day 2 sample runs: 19,805 logical bytes stored as
+11,179 blob bytes (1.77x), and re-ingesting the same spans inserted nothing.
+
+## Limitations
+
+- **One reference agent, fake models.** Every number above comes from a small deterministic
+  support-desk agent with seeded regressions. Nothing here measures how a real model's
+  run-to-run variance interacts with strict matching, how often TOOLS replay misses on a real
+  model that rephrases tool arguments, or how a real LLM judge agrees with humans.
+- **Small, synthetic eval set.** 64 cases from 8 policies on 8 tasks; categories have 1 to 6
+  regressions each, so per-category rates are anecdotes, not estimates. Labels were written by
+  the same author as the detectors.
+- **Replay needs content.** Traces ingested without the opt-in GenAI content attributes keep
+  their structure but cannot be replayed; most instrumentations default content capture off.
+- **Normalisers are per agent.** The default rules cover timestamps, UUIDs and call IDs; an
+  agent with other volatile values (the refund IDs and tag sets here) needs its own rules, and
+  an over-broad rule can hide a real difference.
+- **The sandbox trusts the `side_effect` flag.** A tool that writes but is declared read-only
+  will run live under `--live-reads`.
+- **Streaming and multimodal content** are not modelled: the provider interface returns one
+  complete text-and-tool-calls message per model call.
+- **Scale.** Alignment is O(n·m) with a cell cap; the blob sweep marks by reading every request
+  blob; the span buffer re-assembles a whole trace on every batch. All fine at the sizes tested,
+  none designed for millions of runs.
+- **No redaction at ingest.** Stored recordings hold full prompts and tool outputs.
+
+## What I'd do next
+
+- A real-model study: record a few hundred runs with a small local model (Ollama) at a fixed
+  temperature, and measure TOOLS-replay miss rates, fuzzy-match precision and gate flakiness
+  with repeats, so thresholds can be set from data rather than policy.
+- Judge calibration: label a set of runs by hand and report the judge's agreement (Cohen's
+  kappa) before trusting its verdicts in the gate.
+- Redaction at ingest (PII patterns and per-attribute allow lists) applied before blobs are
+  written, so recordings can leave production.
+- An adapter that records LangGraph and OpenAI Agents SDK runs in-process (not only via OTLP),
+  plus importers for their trace formats.
+- Incremental blob marking and partitioned span buffers for large stores; a GitHub Action that
+  posts the gate's Markdown as a PR comment.
+- Minimised counterexamples: when the gate fails, shrink the suite to the smallest set of cases
+  that still breaches.
 
 ## License
 

@@ -1,5 +1,7 @@
 # Agent Replay: 7-day plan
 
+> Completed 2026-10-20: all seven milestones shipped. Results are in the README.
+
 One milestone per day. Each day ships working, tested code; Day 7 is evaluation, polish and docs.
 
 | Day | Milestone | Done when |
@@ -37,3 +39,6 @@ One milestone per day. Each day ships working, tested code; Day 7 is evaluation,
   traces with a tombstone rather than only deleting spans, because deleting alone lets a late
   span rebuild a fragment over a complete trajectory. The gate's statistics are documented in
   the README's design trade-offs instead of a new ADR.
+- Day 7 (2026-10-20): the cross-process determinism measurement became a command
+  (`agent-replay determinism`) and a CI step, so the replay-determinism rate in the README is
+  reproducible rather than a one-off script result.
