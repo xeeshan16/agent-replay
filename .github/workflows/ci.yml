@@ -108,6 +108,11 @@ jobs:
           agent-replay eval --out-dir evals/results
           cat evals/results/report.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Replay determinism across processes (exit 1 unless fully stable)
+        run: |
+          agent-replay determinism --pairs 3 --out-dir evals/results
+          cat evals/results/determinism.md >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         with:
           name: eval-report

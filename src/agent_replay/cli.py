@@ -7,6 +7,7 @@
     agent-replay diff baseline.json candidate.json --format md
     agent-replay score candidate.json --baseline baseline.json --format md
     agent-replay eval --out-dir evals/results   # the labelled regression-detection eval
+    agent-replay determinism --pairs 5         # cross-process replay determinism
     agent-replay suite record --out-dir suites/support-desk-v1
     agent-replay gate --baseline suites/support-desk-v1 --policy v2 --junit gate.xml
     agent-replay suite push suites/support-desk-v1   # into the store, readable over the API
@@ -241,6 +242,22 @@ async def _eval(args: argparse.Namespace) -> int:
         (out / "report.md").write_text(text, encoding="utf-8")
     print(text)
     return EXIT_OK
+
+
+async def _determinism(args: argparse.Namespace) -> int:
+    from agent_replay import determinism  # noqa: PLC0415 - only needed for this command
+
+    report = await asyncio.to_thread(determinism.run_determinism, args.pairs)
+    text = determinism.render_markdown(report)
+    if args.out_dir:
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "determinism.json").write_text(
+            json.dumps(report.to_json(), indent=2) + "\n", encoding="utf-8"
+        )
+        (out / "determinism.md").write_text(text, encoding="utf-8")
+    print(text)
+    return EXIT_OK if report.stable else EXIT_DIVERGED
 
 
 def _write(path: str | None, text: str) -> None:
@@ -591,6 +608,12 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--spec", help="scoring spec TOML (default: the support-desk spec)")
     ev.add_argument("--out-dir", help="also write report.json and report.md here")
 
+    det = sub.add_parser(
+        "determinism", help="measure replay determinism across processes (exit 1 if unstable)"
+    )
+    det.add_argument("--pairs", type=int, default=5, help="record/replay process pairs")
+    det.add_argument("--out-dir", help="also write determinism.json and determinism.md here")
+
     _add_suite_parser(sub)
     _add_gate_parser(sub)
 
@@ -615,6 +638,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "diff": _diff,
         "score": _score,
         "eval": _eval,
+        "determinism": _determinism,
         "gate": _gate,
         "demo": _demo,
         "ingest": _ingest,
