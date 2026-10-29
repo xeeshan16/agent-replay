@@ -40,7 +40,7 @@ flowchart LR
     A2[New agent version] --> RP
     RP -- every tool call --> SB{Sandbox}
     SB -- recorded --> M
-    SB -- unrecorded read<br/>--live-reads --> LT[Live read-only tools]
+    SB -->|"unrecorded read<br/>(--live-reads)"| LT[Live read-only tools]
     SB -- unrecorded write --> BL[Blocked: fail or error result]
     RP --> T2[(Replayed trajectory)]
     T --> D[Diff<br/>alignment + reasons]
